@@ -331,6 +331,59 @@ def battery_percent(mac):
 
 
 # ---------------------------------------------------------------------------
+# Volume: plain PipeWire/PulseAudio sink control. This doesn't touch the
+# Sony proprietary protocol at all -- it's the same A2DP audio sink any
+# Bluetooth headphone exposes, so it works regardless of the NC/EQ blocker.
+# ---------------------------------------------------------------------------
+
+def find_bluetooth_sink(mac):
+    code, out, _ = run(["pactl", "-f", "json", "list", "sinks"])
+    if code != 0 or not out:
+        return None
+    try:
+        sinks = json.loads(out)
+    except Exception:
+        return None
+    for sink in sinks:
+        props = sink.get("properties", {})
+        if props.get("api.bluez5.address", "").upper() == mac.upper():
+            return sink
+    return None
+
+
+def get_volume_state(mac):
+    sink = find_bluetooth_sink(mac)
+    if sink is None:
+        return None
+    volume = sink.get("volume", {})
+    percents = []
+    for channel in volume.values():
+        m = re.match(r"(\d+)%", str(channel.get("value_percent", "")))
+        if m:
+            percents.append(int(m.group(1)))
+    if not percents:
+        return None
+    return {"percent": round(sum(percents) / len(percents)), "muted": bool(sink.get("mute", False))}
+
+
+def set_volume(mac, percent):
+    sink = find_bluetooth_sink(mac)
+    if sink is None:
+        return False
+    percent = max(0, min(150, round(percent)))
+    code, _, _ = run(["pactl", "set-sink-volume", sink["name"], f"{percent}%"])
+    return code == 0
+
+
+def set_mute(mac, muted):
+    sink = find_bluetooth_sink(mac)
+    if sink is None:
+        return False
+    code, _, _ = run(["pactl", "set-sink-mute", sink["name"], "1" if muted else "0"])
+    return code == 0
+
+
+# ---------------------------------------------------------------------------
 # State persistence
 # ---------------------------------------------------------------------------
 
@@ -409,7 +462,7 @@ def detect(mac=None):
         connected, scheme = try_channel(mac, channel, timeout=2.0)
         if scheme:
             state = load_state()
-            state.update({"mac": mac, "channel": channel, "scheme": scheme})
+            state.update({"mac": mac, "channel": channel, "scheme": scheme, "last_detect_error": None})
             save_state(state)
             return {"success": True, "mac": mac, "channel": channel, "scheme": scheme, "via": "sdp"}
         if not connected:
@@ -419,20 +472,22 @@ def detect(mac=None):
         connected, scheme = try_channel(mac, channel, timeout=1.2)
         if scheme:
             state = load_state()
-            state.update({"mac": mac, "channel": channel, "scheme": scheme})
+            state.update({"mac": mac, "channel": channel, "scheme": scheme, "last_detect_error": None})
             save_state(state)
             return {"success": True, "mac": mac, "channel": channel, "scheme": scheme, "via": "scan"}
 
     if sdp_channel_refused is not None:
-        return {
-            "success": False,
-            "mac": mac,
-            "error": f"The headset's own SDP database points at RFCOMM channel {sdp_channel_refused} "
-                     "for the Sony control service, but connecting to it was refused. The channel is "
-                     "registered but not currently accepting connections -- this needs a real packet "
-                     "capture of the official Sony app to see what it does differently before this can "
-                     "be fixed. See README.md.",
-        }
+        error = (
+            f"Headphone controls (Noise Cancelling/Equalizer) are not available on this unit: its own "
+            f"SDP database points controls at RFCOMM channel {sdp_channel_refused}, but the headset's "
+            "firmware refuses that connection outright -- confirmed at the protocol level, not a "
+            "timeout or missing service. This is a permanent block pending a packet capture of the "
+            "official Sony app; see README.md. Volume still works normally."
+        )
+        state = load_state()
+        state.update({"mac": mac, "last_detect_error": error})
+        save_state(state)
+        return {"success": False, "mac": mac, "error": error}
 
     return {
         "success": False,
@@ -523,6 +578,7 @@ def default_status(error=None):
         "bt_connected": False,
         "connected": False,
         "battery": None,
+        "volume": None,
         "nc": None,
         "eq": None,
         "error": error,
@@ -548,10 +604,11 @@ def cmd_status():
         "name": device_name(mac) or "Sony WH-CH720N",
         "bt_connected": is_device_connected(mac),
         "battery": battery_percent(mac),
+        "volume": get_volume_state(mac),
     })
 
     if not state.get("channel"):
-        result["error"] = "Not yet detected. Run Detect Device once."
+        result["error"] = state.get("last_detect_error") or "Headphone controls not yet detected. Run Detect Device once."
         print(json.dumps(result))
         return
 
@@ -585,6 +642,32 @@ def cmd_forget():
     if STATE_PATH.exists():
         STATE_PATH.unlink()
     print(json.dumps({"success": True}))
+
+
+def resolve_mac():
+    state = load_state()
+    return state.get("mac") or guess_sony_mac(find_paired_devices())
+
+
+def cmd_set_volume(args):
+    mac = resolve_mac()
+    if not mac or not set_volume(mac, args.percent):
+        print(json.dumps({"success": False, "error": "Headset audio sink not found"}))
+        return
+    print(json.dumps({"success": True, "percent": args.percent}))
+
+
+def cmd_toggle_mute(args):
+    mac = resolve_mac()
+    if not mac:
+        print(json.dumps({"success": False, "error": "Headset audio sink not found"}))
+        return
+    current = get_volume_state(mac)
+    next_muted = not (current and current.get("muted"))
+    if not set_mute(mac, next_muted):
+        print(json.dumps({"success": False, "error": "Headset audio sink not found"}))
+        return
+    print(json.dumps({"success": True, "muted": next_muted}))
 
 
 def cmd_set_nc(args):
@@ -651,6 +734,11 @@ def main():
     p_eq.add_argument("--preset", required=True, choices=list(EQ_PRESETS.keys()))
     p_eq.add_argument("--bands", default=None, help="comma separated dB values, e.g. -4,-2,0,2,4")
 
+    p_vol = sub.add_parser("set-volume")
+    p_vol.add_argument("--percent", type=int, required=True)
+
+    sub.add_parser("toggle-mute")
+
     args = parser.parse_args()
 
     if args.command == "status" or not args.command:
@@ -663,6 +751,10 @@ def main():
         cmd_set_nc(args)
     elif args.command == "set-eq":
         cmd_set_eq(args)
+    elif args.command == "set-volume":
+        cmd_set_volume(args)
+    elif args.command == "toggle-mute":
+        cmd_toggle_mute(args)
 
 
 if __name__ == "__main__":

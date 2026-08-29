@@ -58,16 +58,22 @@ prerequisite step is found.
 
 ## What's implemented
 
-- **Noise Control**: Off / Noise Cancelling / Ambient Sound, plus a Voice
-  Focus toggle.
-- **Equalizer**: the 16 built-in presets plus a 5-band Custom EQ (-10..+10 dB
-  per band).
+- **Volume**: works normally. This is plain PipeWire/PulseAudio sink
+  control (`pactl`), not the Sony proprietary protocol, so it's unaffected
+  by the blocker above — every Bluetooth headphone exposes this the same
+  way. First tab, shown by default.
+- **Noise Control**: implemented (Off / Noise Cancelling / Ambient Sound,
+  plus a Voice Focus toggle), but **not functional on the WH-CH720N** — see
+  Status above.
+- **Equalizer**: implemented (16 built-in presets plus a 5-band Custom EQ,
+  -10..+10 dB per band), same blocker as Noise Control.
 
 ## Files
 
-- `sony_wh_ctl.py` — protocol implementation (frame codec, RFCOMM transport,
-  channel/dialect detection, NC/EQ get & set) and CLI (`status`, `detect`,
-  `set-nc`, `set-eq`, `forget`).
+- `sony_wh_ctl.py` — volume control (`pactl`), Sony MDR protocol
+  implementation (frame codec, RFCOMM transport, SDP channel resolution,
+  channel/dialect detection, NC/EQ get & set), and CLI (`status`, `detect`,
+  `set-volume`, `toggle-mute`, `set-nc`, `set-eq`, `forget`).
 - `Panel.qml` / `Model.js` — bar icon + popup UI, following the same
   Process-per-action pattern as other Omarchy device-control plugins.
 

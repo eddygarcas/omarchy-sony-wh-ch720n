@@ -27,12 +27,13 @@ Panel {
     connected: false,
     name: "Sony WH-CH720N",
     battery: null,
+    volume: null,
     nc: { mode: "off", voice_focus: false },
     eq: { preset: "off", bands: [0, 0, 0, 0, 0] },
     error: null
   })
 
-  property string activeTab: "noise" // "noise" | "eq"
+  property string activeTab: "volume" // "volume" | "noise" | "eq"
   property bool isDetecting: false
   property string lastActionNote: ""
 
@@ -42,6 +43,15 @@ Panel {
 
   function fetchStatus() {
     if (!statusProc.running) statusProc.running = true
+  }
+
+  function setVolume(percent) {
+    volumeProc.command = ["python3", root.scriptPath(), "set-volume", "--percent", String(Math.round(percent))]
+    if (!volumeProc.running) volumeProc.running = true
+  }
+
+  function toggleMute() {
+    if (!muteProc.running) muteProc.running = true
   }
 
   function setNcMode(mode) {
@@ -110,6 +120,23 @@ Panel {
           // transient parse error; keep last known status
         }
       }
+    }
+  }
+
+  Process {
+    id: volumeProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.fetchStatus()
+    }
+  }
+
+  Process {
+    id: muteProc
+    command: ["python3", root.scriptPath(), "toggle-mute"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.fetchStatus()
     }
   }
 
@@ -261,47 +288,34 @@ Panel {
           anchors.fill: parent
           spacing: Style.space(2)
 
-          BorderSurface {
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-            radius: Style.space(14)
-            color: root.activeTab === "noise" ? Style.selectedFillFor(root.foreground, root.accent) : "transparent"
+          Repeater {
+            model: [
+              { key: "volume", label: "Volume" },
+              { key: "noise", label: "Noise Control" },
+              { key: "eq", label: "Equalizer" }
+            ]
 
-            Text {
-              anchors.centerIn: parent
-              text: "Noise Control"
-              color: root.activeTab === "noise" ? root.foreground : root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: root.activeTab === "noise"
-            }
+            delegate: BorderSurface {
+              required property var modelData
+              Layout.fillWidth: true
+              Layout.fillHeight: true
+              radius: Style.space(14)
+              color: root.activeTab === modelData.key ? Style.selectedFillFor(root.foreground, root.accent) : "transparent"
 
-            MouseArea {
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.activeTab = "noise"
-            }
-          }
+              Text {
+                anchors.centerIn: parent
+                text: modelData.label
+                color: root.activeTab === modelData.key ? root.foreground : root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: root.activeTab === modelData.key
+              }
 
-          BorderSurface {
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-            radius: Style.space(14)
-            color: root.activeTab === "eq" ? Style.selectedFillFor(root.foreground, root.accent) : "transparent"
-
-            Text {
-              anchors.centerIn: parent
-              text: "Equalizer"
-              color: root.activeTab === "eq" ? root.foreground : root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: root.activeTab === "eq"
-            }
-
-            MouseArea {
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.activeTab = "eq"
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.activeTab = modelData.key
+              }
             }
           }
         }
@@ -313,6 +327,77 @@ Panel {
       Item {
         Layout.fillWidth: true
         Layout.fillHeight: true
+
+        // TAB: Volume
+        ColumnLayout {
+          anchors.fill: parent
+          visible: root.activeTab === "volume"
+          spacing: Style.space(14)
+
+          ColumnLayout {
+            Layout.fillWidth: true
+            spacing: Style.space(6)
+
+            RowLayout {
+              Layout.fillWidth: true
+              Text {
+                text: "Volume"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.subtitle
+                font.bold: true
+              }
+              Item { Layout.fillWidth: true }
+              Text {
+                text: root.status.volume ? Math.round(root.status.volume.percent) + "%" : "--"
+                color: Color.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+            }
+
+            RowLayout {
+              Layout.fillWidth: true
+              spacing: Style.space(8)
+
+              Text { text: "🔈"; font.pixelSize: Style.font.body; Layout.alignment: Qt.AlignVCenter }
+
+              PanelSlider {
+                Layout.fillWidth: true
+                bar: root.bar
+                minimum: 0
+                maximum: 100
+                step: 1
+                integer: true
+                value: root.status.volume ? root.status.volume.percent : 0
+                onReleased: function(v) { root.setVolume(v) }
+              }
+
+              Text { text: "🔊"; font.pixelSize: Style.font.body; Layout.alignment: Qt.AlignVCenter }
+            }
+          }
+
+          Toggle {
+            Layout.fillWidth: true
+            label: "Mute"
+            description: "Silence the headphones without changing volume level"
+            checked: !!(root.status.volume && root.status.volume.muted)
+            onClicked: root.toggleMute()
+          }
+
+          Text {
+            visible: !root.status.volume
+            Layout.fillWidth: true
+            text: "No active audio sink for this headset yet -- play something or check it's the selected output device."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          Item { Layout.fillHeight: true }
+        }
 
         // TAB: Noise Control
         ColumnLayout {
