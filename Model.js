@@ -52,8 +52,8 @@ function eqLabel(preset) {
 }
 
 function getTooltipText(status) {
-  if (!status || !status.detected) return "Sony WH-CH720N · Not detected"
-  if (!status.connected) return "Sony WH-CH720N · Not connected"
+  if (!status || !status.bt_connected) return "Sony WH-CH720N · Not connected"
+  if (!status.connected) return "Sony WH-CH720N · Bluetooth connected" + formatBattery(status.battery)
   var nc = status.nc ? ncLabel(status.nc.mode) : "Unknown"
   return "Sony WH-CH720N · " + nc + formatBattery(status.battery)
 }

@@ -23,6 +23,7 @@ Panel {
 
   property var status: ({
     detected: false,
+    bt_connected: false,
     connected: false,
     name: "Sony WH-CH720N",
     battery: null,
@@ -222,12 +223,12 @@ Panel {
 
           Text {
             text: {
-              if (!root.status.detected) return "Not detected"
-              if (!root.status.connected) return "Not connected"
-              return "Connected" + Model.formatBattery(root.status.battery)
+              if (!root.status.bt_connected) return "Not connected"
+              if (root.status.connected) return "Control active" + Model.formatBattery(root.status.battery)
+              return "Bluetooth connected" + Model.formatBattery(root.status.battery)
             }
             textFormat: Text.PlainText
-            color: root.status.connected ? Color.accent : root.dim
+            color: root.status.bt_connected ? Color.accent : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             elide: Text.ElideRight

@@ -520,6 +520,7 @@ def default_status(error=None):
         "detected": False,
         "mac": None,
         "name": "Sony WH-CH720N",
+        "bt_connected": False,
         "connected": False,
         "battery": None,
         "nc": None,
@@ -545,6 +546,7 @@ def cmd_status():
         "detected": bool(state.get("channel")),
         "mac": mac,
         "name": device_name(mac) or "Sony WH-CH720N",
+        "bt_connected": is_device_connected(mac),
         "battery": battery_percent(mac),
     })
 
