@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "eduard.sony-wh-ch720n",
+  "name": "Sony WH-CH720N",
+  "version": "0.1.0",
+  "author": "Eduard G. Castelló",
+  "license": "MIT",
+  "homepage": "https://github.com/eddygarcas/omarchy-sony-wh-ch720n",
+  "description": "Noise Cancelling and Equalizer controls for the Sony WH-CH720N over Bluetooth RFCOMM, using the same reverse-engineered protocol as the Sony | Headphones Connect app. Experimental: command bytes are inferred from other Sony models and not officially documented for this one.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Sony WH-CH720N",
+    "description": "Noise cancelling & equalizer controls",
+    "category": "Hardware",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
