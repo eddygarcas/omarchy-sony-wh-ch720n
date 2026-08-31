@@ -651,10 +651,6 @@ def set_eq(link, preset_name, bands_db=None):
     link.send_command(payload, expect_opcode=None, timeout=1.5)
 
 
-def notify(title, message):
-    run(["notify-send", "-a", "Omarchy", "-i", "audio-headphones", title, message], timeout=3)
-
-
 # ---------------------------------------------------------------------------
 # Call/mic profile fix: some setups have a WirePlumber override that
 # restricts `bluez5.auto-connect` to A2DP roles only (a2dp_sink/a2dp_source).
@@ -715,10 +711,6 @@ def cmd_fix_mic_profile():
 
     code, _, err = run(["systemctl", "--user", "restart", "wireplumber"], timeout=15)
     restarted = code == 0
-    if restarted:
-        notify("Sony WH-CH720N", "Call/mic audio profile fixed -- try your call again.")
-    else:
-        notify("Sony WH-CH720N", "Config fixed, but WirePlumber restart failed -- restart it manually.")
     print(json.dumps({
         "success": True,
         "action": "fixed",
@@ -789,8 +781,6 @@ def cmd_status():
 
 def cmd_detect(args):
     result = detect(mac=args.mac)
-    if result.get("success"):
-        notify("Sony WH-CH720N", "Headset detected and ready to control.")
     print(json.dumps(result))
 
 
@@ -831,7 +821,6 @@ def cmd_set_nc(args):
     try:
         with open_session(state) as link:
             set_nc(link, state.get("scheme", "v2"), args.mode, voice_focus=args.voice_focus, ambient_level=args.ambient_level)
-        notify("Sony WH-CH720N", {"off": "Noise Cancelling off", "nc": "Noise Cancelling on", "ambient": "Ambient Sound on"}[args.mode])
         print(json.dumps({"success": True, "mode": args.mode}))
     except RfcommBusy:
         print(json.dumps({"success": False, "error": "Sony headset control channel is busy with another request -- try again in a moment."}))
@@ -867,10 +856,8 @@ def cmd_set_eq(args):
                         "acknowledgment from the device) -- likely unsupported on this "
                         "model. Off and Custom (explicit band levels) are confirmed working."
                     )
-                    notify("Sony WH-CH720N", f"'{args.preset}' preset not supported by this unit")
                     print(json.dumps({"success": False, "error": error}))
                     return
-        notify("Sony WH-CH720N", f"Equalizer set to {args.preset}")
         print(json.dumps({"success": True, "preset": args.preset, "bands": bands}))
     except RfcommBusy:
         print(json.dumps({"success": False, "error": "Sony headset control channel is busy with another request -- try again in a moment."}))
