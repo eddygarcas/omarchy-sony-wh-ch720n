@@ -567,6 +567,79 @@ def notify(title, message):
 
 
 # ---------------------------------------------------------------------------
+# Call/mic profile fix: some setups have a WirePlumber override that
+# restricts `bluez5.auto-connect` to A2DP roles only (a2dp_sink/a2dp_source).
+# That's fine for music but means WirePlumber can never switch the headset
+# into the HSP/HFP profile a call app needs for the microphone -- audio
+# plays but calls (Meet, Zoom, etc.) get no mic and often no call audio
+# either. WirePlumber's own default already includes the HFP/HSP roles;
+# this only repairs a local override that dropped them.
+# ---------------------------------------------------------------------------
+
+WIREPLUMBER_CONF_DIR = Path.home() / ".config" / "wireplumber" / "wireplumber.conf.d"
+CALL_PROFILE_ROLES = ["hfp_ag", "hsp_ag", "hfp_hf", "hsp_hs"]
+AUTOCONNECT_RE = re.compile(r"(bluez5\.auto-connect\s*=\s*\[)([^\]]*)(\])")
+
+
+def find_restrictive_autoconnect_configs():
+    """[(path, current_roles, missing_roles), ...] for user WirePlumber
+    conf.d files that set bluez5.auto-connect without any of the call
+    profile roles."""
+    hits = []
+    if not WIREPLUMBER_CONF_DIR.is_dir():
+        return hits
+    for path in sorted(WIREPLUMBER_CONF_DIR.glob("*.conf")):
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        m = AUTOCONNECT_RE.search(text)
+        if not m:
+            continue
+        roles = m.group(2).split()
+        missing = [r for r in CALL_PROFILE_ROLES if r not in roles]
+        if missing:
+            hits.append((path, roles, missing))
+    return hits
+
+
+def cmd_fix_mic_profile():
+    hits = find_restrictive_autoconnect_configs()
+    if not hits:
+        print(json.dumps({
+            "success": True,
+            "action": "not_needed",
+            "message": "No restrictive bluez5.auto-connect override found. "
+                       "The call/mic profile is already allowed to auto-connect.",
+        }))
+        return
+
+    fixed_files = []
+    for path, roles, missing in hits:
+        text = path.read_text()
+        backup = path.with_name(path.name + f".bak.{int(time.time())}")
+        backup.write_text(text)
+        new_roles_str = " " + " ".join(roles + missing) + " "
+        new_text = AUTOCONNECT_RE.sub(lambda m: m.group(1) + new_roles_str + m.group(3), text, count=1)
+        path.write_text(new_text)
+        fixed_files.append(str(path))
+
+    code, _, err = run(["systemctl", "--user", "restart", "wireplumber"], timeout=15)
+    restarted = code == 0
+    if restarted:
+        notify("Sony WH-CH720N", "Call/mic audio profile fixed -- try your call again.")
+    else:
+        notify("Sony WH-CH720N", "Config fixed, but WirePlumber restart failed -- restart it manually.")
+    print(json.dumps({
+        "success": True,
+        "action": "fixed",
+        "files": fixed_files,
+        "wireplumber_restarted": restarted,
+        "restart_error": err.strip() if not restarted else None,
+    }))
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -738,6 +811,7 @@ def main():
     p_vol.add_argument("--percent", type=int, required=True)
 
     sub.add_parser("toggle-mute")
+    sub.add_parser("fix-mic-profile")
 
     args = parser.parse_args()
 
@@ -755,6 +829,8 @@ def main():
         cmd_set_volume(args)
     elif args.command == "toggle-mute":
         cmd_toggle_mute(args)
+    elif args.command == "fix-mic-profile":
+        cmd_fix_mic_profile()
 
 
 if __name__ == "__main__":

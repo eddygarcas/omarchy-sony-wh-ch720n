@@ -35,6 +35,7 @@ Panel {
 
   property string activeTab: "volume" // "volume" | "noise" | "eq"
   property bool isDetecting: false
+  property bool isFixingMic: false
   property string lastActionNote: ""
 
   function scriptPath() {
@@ -88,6 +89,11 @@ Panel {
 
   function forgetDevice() {
     if (!forgetProc.running) forgetProc.running = true
+  }
+
+  function fixMicProfile() {
+    root.isFixingMic = true
+    if (!fixMicProc.running) fixMicProc.running = true
   }
 
   Timer {
@@ -190,6 +196,23 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.fetchStatus()
+    }
+  }
+
+  Process {
+    id: fixMicProc
+    command: ["python3", root.scriptPath(), "fix-mic-profile"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.isFixingMic = false
+        var result = {}
+        try { result = JSON.parse(text || "{}") } catch (e) {}
+        if (!result.success) root.lastActionNote = "Error"
+        else if (result.action === "fixed") root.lastActionNote = "Mic profile fixed"
+        else root.lastActionNote = "No fix needed"
+        clearNoteTimer.restart()
+      }
     }
   }
 
@@ -578,6 +601,35 @@ Panel {
           }
         }
 
+        BorderSurface {
+          implicitHeight: Style.space(28)
+          implicitWidth: Style.space(160)
+          radius: Style.space(14)
+          color: fixMicHover.hovered ? Style.selectedFillFor(root.foreground, root.accent) : "transparent"
+          borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
+          Layout.alignment: Qt.AlignVCenter
+
+          RowLayout {
+            anchors.centerIn: parent
+            spacing: 4
+            Text { text: "🎤"; font.pixelSize: Style.font.caption }
+            Text {
+              text: root.isFixingMic ? "Fixing…" : "Fix Call/Mic Audio"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          MouseArea {
+            id: fixMicHover
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.fixMicProfile()
+          }
+        }
+
         Item { Layout.fillWidth: true }
 
         Text {
@@ -587,6 +639,15 @@ Panel {
           font.pixelSize: Style.font.caption
           Layout.alignment: Qt.AlignVCenter
         }
+      }
+
+      Text {
+        Layout.fillWidth: true
+        text: "\"Fix Call/Mic Audio\" repairs a WirePlumber config that lets sound play but blocks the headset's mic in calls (Meet, Zoom, ...)."
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.space(9)
+        wrapMode: Text.WordWrap
       }
     }
   }

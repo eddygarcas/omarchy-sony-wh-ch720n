@@ -67,13 +67,23 @@ prerequisite step is found.
   Status above.
 - **Equalizer**: implemented (16 built-in presets plus a 5-band Custom EQ,
   -10..+10 dB per band), same blocker as Noise Control.
+- **Fix Call/Mic Audio**: a footer button (`fix-mic-profile`) for a common
+  symptom on this class of Bluetooth headset — playback works fine but the
+  microphone (and often call audio) never shows up in video calls. This
+  happens when a WirePlumber override under `~/.config/wireplumber/wireplumber.conf.d/`
+  restricts `bluez5.auto-connect` to A2DP roles only, dropping the HFP/HSP
+  roles WirePlumber needs to switch the headset into its call profile. The
+  fix backs up the offending file, restores the missing roles, and restarts
+  WirePlumber. If no such override exists, it reports that nothing needed
+  fixing rather than touching anything.
 
 ## Files
 
 - `sony_wh_ctl.py` — volume control (`pactl`), Sony MDR protocol
   implementation (frame codec, RFCOMM transport, SDP channel resolution,
-  channel/dialect detection, NC/EQ get & set), and CLI (`status`, `detect`,
-  `set-volume`, `toggle-mute`, `set-nc`, `set-eq`, `forget`).
+  channel/dialect detection, NC/EQ get & set), the WirePlumber call/mic
+  profile fix, and CLI (`status`, `detect`, `set-volume`, `toggle-mute`,
+  `set-nc`, `set-eq`, `forget`, `fix-mic-profile`).
 - `Panel.qml` / `Model.js` — bar icon + popup UI, following the same
   Process-per-action pattern as other Omarchy device-control plugins.
 
