@@ -6,43 +6,69 @@ app exposes. There is no official Linux SDK for Sony's headphones, so this
 talks the reverse-engineered "MDR" protocol directly over a raw Bluetooth
 RFCOMM socket.
 
-## ⚠️ Status: blocked on this unit
+## ✅ Status: working, once the headset is on its classic Bluetooth identity
 
-Tested against a real WH-CH720N (2026-08-29). Findings:
+Previously this README documented the control channel as permanently
+blocked — RFCOMM channel 18 (correctly resolved via SDP) refused the
+connection outright (`SABM` → `DM`, confirmed via `btmon`). That block
+turned out to be a symptom, not a firmware wall: the WH-CH720N was
+connected under its **LE Audio identity** (`bluetoothctl info` showed
+`Name: LE-WH-CH720N`), which doesn't expose the classic SDP/RFCOMM MDR
+control service at all — only the classic BR/EDR identity (`Name:
+WH-CH720N`) does.
 
-- The headset advertises the Sony "v2" MDR service UUID
-  (`956c7b26-d49a-4ba8-b03f-b17d393cb6e2`) over SDP, confirming it speaks the
-  same protocol family as the ULT WEAR.
-- SDP correctly resolves that UUID to **RFCOMM channel 18**.
-- Opening that channel is **actively refused** — confirmed at the RFCOMM
-  frame level via a `btmon` capture: the headset responds to our `SABM`
-  (channel-open request) with a `DM` (Disconnected Mode) frame, RFCOMM's
-  explicit "no". This is deliberate firmware behavior, not a timeout, a
-  missing service, or a bug in this plugin's codec.
-- A full sweep of all 30 possible RFCOMM channels found only channel 2
-  accepts a connection at all, and it doesn't speak the Sony protocol.
+The LE Audio identity was in use because of an unrelated Linux-side bug: a
+local WirePlumber override restricted `bluez5.auto-connect` to A2DP-only
+roles, which also affected which Bluetooth identity/profile set the OS
+negotiated with the headset. Fixing that (see "Fix Call/Mic Audio" below)
+made the headset come up under its classic identity, and the MDR control
+channel opened immediately — no missing authentication step, no need for a
+packet capture from the official app.
 
-So the control channel is gated behind something the official Sony app does
-that a bare RFCOMM open doesn't satisfy — most likely an app-level
-authentication step, since classic Bluetooth pairing/encryption is already
-in place and doesn't explain the rejection. **This can't be resolved without
-a capture of the official app's actual traffic**, which this Linux host
-cannot see on its own (its Bluetooth adapter has no visibility into a
-phone's separate Bluetooth link to the headset). To move this forward:
+Confirmed against a real WH-CH720N (2026-08-31), once on the classic
+identity:
 
-1. On an Android phone with the official Sony | Headphones Connect app,
-   enable Developer Options → **Bluetooth HCI snoop log**.
-2. Connect to the headset and toggle NC / EQ in the app to generate traffic.
-3. Pull `/sdcard/btsnoop_hci.log` off the phone and diff it against what
-   `sony_wh_ctl.py` sends — look for what precedes the app's successful
-   RFCOMM open on channel 18 (or whatever channel it resolves to for that
-   phone's Android Bluetooth stack).
+- **Noise Control**: fully working. Reading and setting Off / Noise
+  Cancelling / Ambient Sound + Voice Focus all produce real, verified state
+  changes on the device.
+- **Equalizer — reading**: fully working. The reply layout matches
+  libmdr's `mdr_packet_eqebb_ret_param_t` (`inquired_type, preset_id,
+  num_levels, levels[]`), except this unit only answers `inquired_type =
+  0x00` (not the 0x01/0x02/0x03 values libmdr documents for newer devices —
+  an older/undocumented dialect). It has **6 EQ bands**, not 5.
+- **Equalizer — Custom band levels**: fully working and verified with a
+  real read-modify-readback cycle. Explicit band levels always land as the
+  `custom` preset on readback, regardless of which preset ID was sent
+  alongside them.
+- **Equalizer — named genre presets** (Rock, Jazz, Bass, ...): **not
+  confirmed working on this unit**. Selecting `off` (flat/no EQ) works and
+  gets acknowledged; selecting e.g. `rock` with no explicit band levels
+  gets **no acknowledgment from the device at all** — most likely this
+  model's real supported preset list is just Off + Custom, and the other
+  15 preset IDs in this plugin (inherited from other Sony models'
+  documentation) aren't actually implemented in its firmware. `set-eq`
+  verifies the device actually applied a named preset before reporting
+  success, so picking an unsupported one now surfaces a clear error instead
+  of silently doing nothing.
 
-The frame codec, SDP client, and command payload construction below are
-implemented and exercised against this exact device (SDP resolution and the
-channel-scan fallback both work correctly) — only the final "open the
-channel" step is blocked, so no rewrite should be needed if the missing
-prerequisite step is found.
+**RFCOMM concurrency**: this device's control channel only tolerates one
+open connection at a time -- a second, concurrent `connect()` fails
+immediately with `[Errno 16] Device or resource busy` (confirmed by
+opening 4 sockets to the same channel at once: one succeeds, the other
+three get `EBUSY` instantly). Since the panel's periodic status poll and
+any button action are each a separate `sony_wh_ctl.py` process opening its
+own connection, two landing at the same moment used to collide and surface
+"Could not reach the headset over Bluetooth" even though the headset was
+working fine. Fixed with a cross-process file lock
+(`~/.local/state/omarchy-sony-wh-ch720n/rfcomm.lock`) serializing every
+RFCOMM open across all `sony_wh_ctl.py` invocations, plus a short (250ms)
+cooldown held *before* releasing that lock -- measured 100% failure with a
+0s gap between `close()` and the next `connect()`, 100% success at 0.1s;
+the kernel keeps the channel reserved briefly after `close()` returns while
+it finishes tearing down with the remote device, so the lock has to outlast
+that, not just the local socket lifetime. Verified with concurrent test
+processes hammering `status`/`set-nc` simultaneously: 12/12 and 9/9 clean
+runs after the fix, 2/4 failures before it.
 
 ## Setup
 
@@ -62,11 +88,11 @@ prerequisite step is found.
   control (`pactl`), not the Sony proprietary protocol, so it's unaffected
   by the blocker above — every Bluetooth headphone exposes this the same
   way. First tab, shown by default.
-- **Noise Control**: implemented (Off / Noise Cancelling / Ambient Sound,
-  plus a Voice Focus toggle), but **not functional on the WH-CH720N** — see
-  Status above.
-- **Equalizer**: implemented (16 built-in presets plus a 5-band Custom EQ,
-  -10..+10 dB per band), same blocker as Noise Control.
+- **Noise Control**: fully working (Off / Noise Cancelling / Ambient Sound,
+  plus a Voice Focus toggle) — see Status above.
+- **Equalizer**: reading and Custom EQ (6-band, -10..+10 dB per band) are
+  fully working. The 16 named genre presets are implemented but only `off`
+  is confirmed to actually apply on this unit — see Status above.
 - **Fix Call/Mic Audio**: a footer button (`fix-mic-profile`) for a common
   symptom on this class of Bluetooth headset — playback works fine but the
   microphone (and often call audio) never shows up in video calls. This

@@ -29,7 +29,7 @@ Panel {
     battery: null,
     volume: null,
     nc: { mode: "off", voice_focus: false },
-    eq: { preset: "off", bands: [0, 0, 0, 0, 0] },
+    eq: { preset: "off", bands: [0, 0, 0, 0, 0, 0] },
     error: null
   })
 
@@ -543,7 +543,7 @@ Panel {
                   integer: true
                   value: (root.status.eq && root.status.eq.bands && root.status.eq.bands[index] !== undefined) ? root.status.eq.bands[index] : 0
                   onReleased: function(v) {
-                    var bands = (root.status.eq && root.status.eq.bands) ? root.status.eq.bands.slice() : [0, 0, 0, 0, 0]
+                    var bands = (root.status.eq && root.status.eq.bands) ? root.status.eq.bands.slice() : [0, 0, 0, 0, 0, 0]
                     bands[index] = Math.round(v)
                     root.setEqBands(bands)
                   }

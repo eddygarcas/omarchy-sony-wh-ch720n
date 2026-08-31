@@ -31,7 +31,7 @@ function eqPresetOptions() {
 }
 
 function bandLabels() {
-  return ["Low", "Low-Mid", "Mid", "High-Mid", "High"]
+  return ["Bass", "Low", "Low-Mid", "Mid", "High-Mid", "Treble"]
 }
 
 function formatBattery(pct) {

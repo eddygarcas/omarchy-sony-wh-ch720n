@@ -18,6 +18,8 @@ see README.md.
 """
 
 import argparse
+import contextlib
+import fcntl
 import json
 import re
 import socket
@@ -28,6 +30,7 @@ import uuid as uuid_mod
 from pathlib import Path
 
 STATE_PATH = Path.home() / ".local" / "state" / "omarchy-sony-wh-ch720n" / "state.json"
+RFCOMM_LOCK_PATH = STATE_PATH.parent / "rfcomm.lock"
 
 SOF = 0x3E
 EOF = 0x3C
@@ -47,7 +50,14 @@ EQ_PRESETS = {
     "custom": 0xA0,
 }
 EQ_PRESET_NAMES = {v: k for k, v in EQ_PRESETS.items()}
-EQ_BAND_COUNT = 5
+EQ_BAND_COUNT = 6
+
+# libmdr's mdr_packet_eqebb_inquired_type_t only documents 0x01 (PRESET_EQ),
+# 0x02 (EBB) and 0x03 (PRESET_EQ_NONCUSTOMIZABLE) for newer devices; on the
+# WH-CH720N none of those get a reply, only this one -- confirmed by probing
+# 0x00-0x05 and 0x17 directly and checking which sub-id the device echoes
+# back in its RET payload.
+EQ_INQUIRED_TYPE = 0x00
 
 CHANNEL_SCAN_RANGE = range(1, 31)
 DEFAULT_TIMEOUT = 2.0
@@ -403,13 +413,72 @@ def save_state(state):
 
 # ---------------------------------------------------------------------------
 # RFCOMM connection + protocol dialect probing
+#
+# The WH-CH720N's control channel only tolerates one open RFCOMM connection
+# at a time -- a second concurrent connect() fails immediately with
+# [Errno 16] Device or resource busy (confirmed by opening 4 sockets to the
+# same channel at once: one succeeds, the other three get EBUSY instantly,
+# not a timeout). Since each CLI invocation (the panel's periodic status
+# poll, or any button action) is a separate process that opens its own
+# connection, two invocations landing at the same moment collide. A
+# cross-process file lock serializes them.
+#
+# Serializing alone isn't quite enough: even with no other local process
+# involved, the kernel keeps the channel busy for a short window *after*
+# close() returns while it finishes tearing down with the remote device --
+# measured at 100% failure with 0s gap between close() and the next
+# connect(), 100% success at 0.1s (10/10 trials each way; RFCOMM_COOLDOWN
+# below adds margin on top of that). So the cooldown is applied before the
+# lock is released, not after -- otherwise a waiting process just inherits
+# the same race.
 # ---------------------------------------------------------------------------
+
+RFCOMM_COOLDOWN = 0.25
+
+
+class RfcommBusy(Exception):
+    """Another sony_wh_ctl.py invocation is already holding the RFCOMM channel."""
+
+
+@contextlib.contextmanager
+def rfcomm_lock(timeout=8.0):
+    RFCOMM_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    f = open(RFCOMM_LOCK_PATH, "w")
+    acquired = False
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RfcommBusy("Sony headset control channel is busy with another request")
+                time.sleep(0.1)
+        yield
+    finally:
+        if acquired:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        f.close()
+
 
 def connect_rfcomm(mac, channel, timeout=3.0):
     sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
     sock.settimeout(timeout)
     sock.connect((mac, channel))
     return sock
+
+
+def close_rfcomm(sock):
+    """Close an RFCOMM socket and wait out its kernel-level teardown cooldown.
+    Call this while still holding rfcomm_lock() so a waiting process doesn't
+    inherit the same busy race."""
+    try:
+        sock.close()
+    except Exception:
+        pass
+    time.sleep(RFCOMM_COOLDOWN)
 
 
 def probe_scheme(link):
@@ -429,18 +498,19 @@ def try_channel(mac, channel, timeout=1.2):
     opened at all (even if the protocol probe got no reply), which matters
     for diagnosing a channel SDP points at but that refuses the connection
     outright -- a real failure mode seen on the WH-CH720N."""
-    sock = None
     try:
-        sock = connect_rfcomm(mac, channel, timeout=timeout)
-    except OSError:
+        with rfcomm_lock():
+            sock = None
+            try:
+                sock = connect_rfcomm(mac, channel, timeout=timeout)
+            except OSError:
+                return False, None
+            try:
+                return True, probe_scheme(SonyLink(sock))
+            finally:
+                close_rfcomm(sock)
+    except RfcommBusy:
         return False, None
-    try:
-        return True, probe_scheme(SonyLink(sock))
-    finally:
-        try:
-            sock.close()
-        except Exception:
-            pass
 
 
 def detect(mac=None):
@@ -497,16 +567,31 @@ def detect(mac=None):
     }
 
 
-def open_link(state):
+class LinkUnavailable(Exception):
+    """Could not open the RFCOMM channel (not detected yet, or a real connect failure)."""
+
+
+@contextlib.contextmanager
+def open_session(state):
+    """Open the cached RFCOMM channel for the duration of the `with` block,
+    serialized against any other sony_wh_ctl.py invocation via rfcomm_lock()
+    (see its docstring -- this channel only tolerates one connection at a
+    time). Raises RfcommBusy if another invocation is holding it past the
+    wait, or LinkUnavailable for "not detected yet" / a real connect
+    failure."""
     mac = state.get("mac")
     channel = state.get("channel")
     if not mac or not channel:
-        return None, "not_detected"
-    try:
-        sock = connect_rfcomm(mac, channel, timeout=2.5)
-    except OSError as e:
-        return None, str(e)
-    return SonyLink(sock), None
+        raise LinkUnavailable("not_detected")
+    with rfcomm_lock():
+        try:
+            sock = connect_rfcomm(mac, channel, timeout=2.5)
+        except OSError as e:
+            raise LinkUnavailable(str(e))
+        try:
+            yield SonyLink(sock)
+        finally:
+            close_rfcomm(sock)
 
 
 # ---------------------------------------------------------------------------
@@ -543,11 +628,15 @@ def set_nc(link, scheme, mode, voice_focus=False, ambient_level=10):
 
 
 def query_eq(link):
-    payload = link.send_command(bytes([CMD_EQ_GET, 0x01]), expect_opcode=CMD_EQ_RET)
-    if payload and len(payload) >= 3:
-        preset_id = payload[1]
-        num_levels = payload[2]
-        bands = [b - 10 for b in payload[3:3 + num_levels]]
+    # Reply layout is libmdr's mdr_packet_eqebb_ret_param_t: [opcode,
+    # inquired_type, preset_id, num_levels, level0..levelN]. The WH-CH720N
+    # answers only inquired_type 0x00 (not the 0x01/0x02/0x03 values libmdr
+    # documents for other devices -- an older/undocumented dialect).
+    payload = link.send_command(bytes([CMD_EQ_GET, EQ_INQUIRED_TYPE]), expect_opcode=CMD_EQ_RET)
+    if payload and len(payload) >= 4:
+        preset_id = payload[2]
+        num_levels = payload[3]
+        bands = [b - 10 for b in payload[4:4 + num_levels]]
         return {"preset": EQ_PRESET_NAMES.get(preset_id, "custom"), "bands": bands}
     return None
 
@@ -556,9 +645,9 @@ def set_eq(link, preset_name, bands_db=None):
     preset_id = EQ_PRESETS.get(preset_name, 0xA0)
     if bands_db:
         levels = [max(0, min(20, round(b) + 10)) for b in bands_db]
-        payload = bytes([CMD_EQ_SET, preset_id, len(levels)]) + bytes(levels)
+        payload = bytes([CMD_EQ_SET, EQ_INQUIRED_TYPE, preset_id, len(levels)]) + bytes(levels)
     else:
-        payload = bytes([CMD_EQ_SET, preset_id, 0])
+        payload = bytes([CMD_EQ_SET, EQ_INQUIRED_TYPE, preset_id, 0])
     link.send_command(payload, expect_opcode=None, timeout=1.5)
 
 
@@ -685,21 +774,15 @@ def cmd_status():
         print(json.dumps(result))
         return
 
-    link, err = open_link(state)
-    if link is None:
-        result["error"] = "Could not reach the headset over Bluetooth (is it on and in range?)"
-        print(json.dumps(result))
-        return
-
-    result["connected"] = True
     try:
-        result["nc"] = query_nc(link, state.get("scheme", "v2"))
-        result["eq"] = query_eq(link)
-    finally:
-        try:
-            link.sock.close()
-        except Exception:
-            pass
+        with open_session(state) as link:
+            result["nc"] = query_nc(link, state.get("scheme", "v2"))
+            result["eq"] = query_eq(link)
+        result["connected"] = True
+    except RfcommBusy:
+        result["error"] = "Sony headset control channel is busy with another request -- try again in a moment."
+    except LinkUnavailable:
+        result["error"] = "Could not reach the headset over Bluetooth (is it on and in range?)"
 
     print(json.dumps(result))
 
@@ -745,29 +828,21 @@ def cmd_toggle_mute(args):
 
 def cmd_set_nc(args):
     state = load_state()
-    link, err = open_link(state)
-    if link is None:
-        print(json.dumps({"success": False, "error": "Headset not reachable"}))
-        return
     try:
-        set_nc(link, state.get("scheme", "v2"), args.mode, voice_focus=args.voice_focus, ambient_level=args.ambient_level)
+        with open_session(state) as link:
+            set_nc(link, state.get("scheme", "v2"), args.mode, voice_focus=args.voice_focus, ambient_level=args.ambient_level)
         notify("Sony WH-CH720N", {"off": "Noise Cancelling off", "nc": "Noise Cancelling on", "ambient": "Ambient Sound on"}[args.mode])
         print(json.dumps({"success": True, "mode": args.mode}))
+    except RfcommBusy:
+        print(json.dumps({"success": False, "error": "Sony headset control channel is busy with another request -- try again in a moment."}))
+    except LinkUnavailable:
+        print(json.dumps({"success": False, "error": "Headset not reachable"}))
     except OSError as e:
         print(json.dumps({"success": False, "error": str(e)}))
-    finally:
-        try:
-            link.sock.close()
-        except Exception:
-            pass
 
 
 def cmd_set_eq(args):
     state = load_state()
-    link, err = open_link(state)
-    if link is None:
-        print(json.dumps({"success": False, "error": "Headset not reachable"}))
-        return
     bands = None
     if args.bands:
         try:
@@ -776,16 +851,33 @@ def cmd_set_eq(args):
             print(json.dumps({"success": False, "error": "Bad --bands value"}))
             return
     try:
-        set_eq(link, args.preset, bands_db=bands)
+        with open_session(state) as link:
+            set_eq(link, args.preset, bands_db=bands)
+            if bands is None and args.preset not in ("off", "custom"):
+                # Named genre presets (rock/jazz/...) aren't confirmed supported
+                # on every unit -- some preset IDs get no acknowledgment at all
+                # from the WH-CH720N (likely unsupported on this model), while
+                # the SET call itself never raises. Verify against a fresh read
+                # instead of trusting a silent no-op as success.
+                time.sleep(0.3)
+                readback = query_eq(link)
+                if not readback or readback.get("preset") != args.preset:
+                    error = (
+                        f"This headset did not accept the '{args.preset}' preset (no "
+                        "acknowledgment from the device) -- likely unsupported on this "
+                        "model. Off and Custom (explicit band levels) are confirmed working."
+                    )
+                    notify("Sony WH-CH720N", f"'{args.preset}' preset not supported by this unit")
+                    print(json.dumps({"success": False, "error": error}))
+                    return
         notify("Sony WH-CH720N", f"Equalizer set to {args.preset}")
         print(json.dumps({"success": True, "preset": args.preset, "bands": bands}))
+    except RfcommBusy:
+        print(json.dumps({"success": False, "error": "Sony headset control channel is busy with another request -- try again in a moment."}))
+    except LinkUnavailable:
+        print(json.dumps({"success": False, "error": "Headset not reachable"}))
     except OSError as e:
         print(json.dumps({"success": False, "error": str(e)}))
-    finally:
-        try:
-            link.sock.close()
-        except Exception:
-            pass
 
 
 def main():

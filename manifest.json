@@ -2,11 +2,11 @@
   "schemaVersion": 1,
   "id": "eduard.sony-wh-ch720n",
   "name": "Sony WH-CH720N",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "author": "Eduard G. Castelló",
   "license": "MIT",
   "homepage": "https://github.com/eddygarcas/omarchy-sony-wh-ch720n",
-  "description": "Noise Cancelling and Equalizer controls for the Sony WH-CH720N over Bluetooth RFCOMM, using the same reverse-engineered protocol as the Sony | Headphones Connect app. Experimental: command bytes are inferred from other Sony models and not officially documented for this one.",
+  "description": "Noise Cancelling and Equalizer controls for the Sony WH-CH720N over Bluetooth RFCOMM, using the same reverse-engineered protocol as the Sony | Headphones Connect app. Noise Control and Custom EQ are confirmed working; named genre EQ presets beyond Off are not confirmed supported on this model.",
   "kinds": [
     "bar-widget"
   ],
