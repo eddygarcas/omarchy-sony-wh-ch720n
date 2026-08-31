@@ -261,7 +261,7 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰋋"
+    text: "󰋍"
     tooltipText: Model.getTooltipText(root.status)
     active: !!(root.status && root.status.nc && root.status.nc.mode !== "off")
     onPressed: function(buttonCode) { root.toggle() }
@@ -286,7 +286,7 @@ Panel {
         spacing: Style.space(14)
 
         Text {
-          text: "󰋋"
+          text: "󰋍"
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.space(32)
