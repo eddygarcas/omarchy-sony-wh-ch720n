@@ -6,6 +6,18 @@ app exposes. There is no official Linux SDK for Sony's headphones, so this
 talks the reverse-engineered "MDR" protocol directly over a raw Bluetooth
 RFCOMM socket.
 
+## Install
+
+```
+git clone https://github.com/eddygarcas/omarchy-sony-wh-ch720n.git \
+  ~/.config/omarchy/plugins/eduard.sony-wh-ch720n
+omarchy-shell shell rescanPlugins
+omarchy plugin enable eduard.sony-wh-ch720n
+```
+
+Requires Python 3 (already on every Omarchy install) and `bluetoothctl`
+(BlueZ, also standard). No other dependencies.
+
 ## ✅ Status: working, once the headset is on its classic Bluetooth identity
 
 Previously this README documented the control channel as permanently
@@ -82,6 +94,23 @@ runs after the fix, 2/4 failures before it.
    headset's channel changes (uncommon, but a firmware update could do it —
    just run Detect again).
 
+## Removal
+
+```
+omarchy plugin remove eduard.sony-wh-ch720n
+```
+
+This removes the plugin's files and its bar entry. It does not touch your
+Bluetooth pairing or any WirePlumber config the "Fix Call/Mic Audio" button
+may have edited (that fix is a legitimate system-level correction meant to
+outlive the plugin, backed up alongside the edit under
+`~/.config/wireplumber/wireplumber.conf.d/*.bak.*`). To fully clean up,
+also remove:
+
+```
+rm -rf ~/.local/state/omarchy-sony-wh-ch720n
+```
+
 ## What's implemented
 
 - **Volume**: works normally. This is plain PipeWire/PulseAudio sink
@@ -103,6 +132,30 @@ runs after the fix, 2/4 failures before it.
   WirePlumber. If no such override exists, it reports that nothing needed
   fixing rather than touching anything.
 
+## Permissions & dependencies
+
+- Requires Python 3 and `bluetoothctl` (BlueZ) on `PATH` — both standard on
+  any Omarchy install. No other runtime dependencies.
+- Talks raw Bluetooth directly: `AF_BLUETOOTH`/`BTPROTO_RFCOMM` sockets for
+  the Sony MDR control channel, and an `L2CAP` SDP query to resolve it —
+  lower-level than a typical audio plugin, since there's no standard API
+  for vendor NC/EQ protocols. Volume/mute instead use plain `pactl`
+  (PipeWire/PulseAudio), the same as any other audio widget.
+- **Fix Call/Mic Audio** reads `~/.config/wireplumber/wireplumber.conf.d/*.conf`
+  and writes only to a file it already found there with a `bluez5.auto-connect`
+  override missing the HFP/HSP call-profile roles — never touches a file
+  without that exact match, never touches anything under `/etc` or
+  `/usr/share`. Backs the file up (`<name>.bak.<epoch>`) before editing, and
+  runs `systemctl --user restart wireplumber` afterward. Reports "nothing
+  needed fixing" and changes nothing if no such override exists.
+- State lives under `~/.local/state/omarchy-sony-wh-ch720n/`: the detected
+  MAC/RFCOMM channel/protocol dialect (`state.json`), and a lock file
+  (`rfcomm.lock`) used only to serialize concurrent RFCOMM opens against
+  itself — never touched by any other process.
+- No network access at all.
+- Like every Quickshell plugin, `Panel.qml` runs unsandboxed inside the
+  shared `omarchy-shell` process — review it before installing.
+
 ## Files
 
 - `sony_wh_ctl.py` — volume control (`pactl`), Sony MDR protocol
@@ -113,10 +166,17 @@ runs after the fix, 2/4 failures before it.
 - `Panel.qml` / `Model.js` — bar icon + popup UI, following the same
   Process-per-action pattern as other Omarchy device-control plugins.
 
-## References
+## Credits
 
 Protocol details reverse-engineered by the community, not Sony:
 
 - https://github.com/AndreasOlofsson/mdr-protocol (command ID tables)
 - https://github.com/AndreasOlofsson/libmdr (NC/EQ payload structs, GPL-3.0 — consulted as reference only, no code copied)
 - https://github.com/Leonard013/sony-ult-ctl (MIT — working Python frame codec this plugin's codec is based on)
+
+Inspired by GM's [AirPods](https://github.com/thisisgm/omarchy-pods) plugin
+(`io.github.thisisgm.omapods`) — the first Omarchy bar widget to bring
+Bluetooth headphone listening-mode controls (ANC, ambient, ear detection)
+into the shell for AirPods. This plugin follows the same idea for Sony's
+WH-CH720N, over the very different MDR protocol Sony's own headsets speak
+instead of Apple's.
