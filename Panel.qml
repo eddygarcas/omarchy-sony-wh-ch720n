@@ -37,6 +37,22 @@ Panel {
   property bool isDetecting: false
   property bool isFixingMic: false
   property string lastActionNote: ""
+  property string pendingNcMode: ""
+
+  onStatusChanged: {
+    // Keep the spinner up until the readback actually confirms the new
+    // mode, not just until the set-nc call returns -- the RFCOMM round
+    // trip means "success" and "status reflects it" land at different times.
+    if (root.pendingNcMode && root.status.nc && root.status.nc.mode === root.pendingNcMode) {
+      root.pendingNcMode = ""
+    }
+  }
+
+  Timer {
+    id: pendingNcTimeoutTimer
+    interval: 6000
+    onTriggered: root.pendingNcMode = ""
+  }
 
   function scriptPath() {
     return Qt.resolvedUrl("sony_wh_ctl.py").toString().replace(/^file:\/\//, "")
@@ -60,6 +76,8 @@ Panel {
     var args = [Quickshell.env("PYTHON") || "python3", root.scriptPath(), "set-nc", "--mode", mode]
     if (voiceFocus) args.push("--voice-focus")
     ncProc.command = args
+    root.pendingNcMode = mode
+    pendingNcTimeoutTimer.restart()
     if (!ncProc.running) ncProc.running = true
   }
 
@@ -155,6 +173,7 @@ Panel {
         try { ok = JSON.parse(text || "{}").success } catch (e) {}
         root.lastActionNote = ok ? "Saved" : "Error"
         clearNoteTimer.restart()
+        if (!ok) { root.pendingNcMode = ""; pendingNcTimeoutTimer.stop() }
         root.fetchStatus()
       }
     }
@@ -435,7 +454,8 @@ Panel {
               Layout.fillWidth: true
               implicitHeight: Style.space(56)
               radius: Style.space(14)
-              readonly property bool selected: !!(root.status.nc && root.status.nc.mode === modelData.value)
+              readonly property bool pending: modelData.value === root.pendingNcMode
+              readonly property bool selected: !!(root.status.nc && root.status.nc.mode === modelData.value) || pending
               color: selected ? Style.selectedFillFor(root.foreground, root.accent) : Style.normalFillFor(root.foreground, root.accent)
               borderSpec: Border.controlSpec(selected ? "selected" : "normal", root.foreground, root.accent)
 
@@ -446,10 +466,24 @@ Panel {
                 spacing: Style.space(10)
 
                 Text {
-                  text: modelData.icon
+                  id: ncTileIcon
+                  text: pending ? "󰑐" : modelData.icon
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.heading
+                  horizontalAlignment: Text.AlignHCenter
+                  Layout.preferredWidth: Style.space(28)
+
+                  RotationAnimation {
+                    target: ncTileIcon
+                    property: "rotation"
+                    from: 0
+                    to: 360
+                    duration: 900
+                    loops: Animation.Infinite
+                    running: pending
+                    onRunningChanged: if (!running) ncTileIcon.rotation = 0
+                  }
                 }
 
                 ColumnLayout {
@@ -583,7 +617,25 @@ Panel {
           RowLayout {
             anchors.centerIn: parent
             spacing: 4
-            Text { text: "󰂯"; color: root.foreground; font.family: root.fontFamily }
+            Text {
+              id: detectIcon
+              text: root.isDetecting ? "󰑐" : "󰂯"
+              color: root.foreground
+              font.family: root.fontFamily
+              horizontalAlignment: Text.AlignHCenter
+              width: Style.space(16)
+
+              RotationAnimation {
+                target: detectIcon
+                property: "rotation"
+                from: 0
+                to: 360
+                duration: 900
+                loops: Animation.Infinite
+                running: root.isDetecting
+                onRunningChanged: if (!running) detectIcon.rotation = 0
+              }
+            }
             Text {
               text: root.isDetecting ? "Detecting…" : "Detect Device"
               color: root.foreground
@@ -612,7 +664,25 @@ Panel {
           RowLayout {
             anchors.centerIn: parent
             spacing: 4
-            Text { text: "🎤"; font.pixelSize: Style.font.caption }
+            Text {
+              id: fixMicIcon
+              text: root.isFixingMic ? "󰑐" : "🎤"
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              horizontalAlignment: Text.AlignHCenter
+              width: Style.space(16)
+
+              RotationAnimation {
+                target: fixMicIcon
+                property: "rotation"
+                from: 0
+                to: 360
+                duration: 900
+                loops: Animation.Infinite
+                running: root.isFixingMic
+                onRunningChanged: if (!running) fixMicIcon.rotation = 0
+              }
+            }
             Text {
               text: root.isFixingMic ? "Fixing…" : "Fix Call/Mic Audio"
               color: root.foreground
@@ -631,14 +701,20 @@ Panel {
         }
 
         Item { Layout.fillWidth: true }
+      }
 
-        Text {
-          text: root.lastActionNote ? "✓ " + root.lastActionNote : ""
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          Layout.alignment: Qt.AlignVCenter
-        }
+      // On its own row (not sharing space with the fixed-width footer
+      // buttons above) so it never overflows and never changes their
+      // layout when it appears/disappears -- Text reserves its line
+      // height even when empty, so this row's height is stable too.
+      Text {
+        Layout.fillWidth: true
+        text: root.lastActionNote ? "✓ " + root.lastActionNote : ""
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        horizontalAlignment: Text.AlignRight
+        elide: Text.ElideRight
       }
 
       Text {
