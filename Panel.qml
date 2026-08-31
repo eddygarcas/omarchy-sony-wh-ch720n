@@ -11,7 +11,6 @@ Panel {
   id: root
   moduleName: "eduard.sony-wh-ch720n"
   ipcTarget: "eduard.sony-wh-ch720n"
-  manageIpc: false
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -137,15 +136,6 @@ Panel {
     onTriggered: root.fetchStatus()
   }
 
-  IpcHandler {
-    enabled: true
-    target: root.ipcTarget
-    function open(): void { root.open() }
-    function close(): void { root.close() }
-    function show(): void { root.open() }
-    function hide(): void { root.close() }
-    function toggle(): void { root.toggle() }
-  }
 
   Process {
     id: statusProc
