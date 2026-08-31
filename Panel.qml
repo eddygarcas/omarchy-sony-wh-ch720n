@@ -62,12 +62,28 @@ Panel {
     if (!statusProc.running) statusProc.running = true
   }
 
+  function updateVolumeOptimistic(patch) {
+    // PanelSlider snaps its knob back to the bound `value` the instant you
+    // release it (see its onReleased), before our async pactl call resolves
+    // -- update local state immediately so that binding already matches
+    // the target, instead of visibly snapping back then forward once the
+    // real status refresh lands (which is also slow here since it re-queries
+    // NC/EQ over Bluetooth even though volume/mute never touch RFCOMM).
+    var current = root.status.volume || {percent: 0, muted: false}
+    var next = Object.assign({}, root.status)
+    next.volume = Object.assign({}, current, patch)
+    root.status = next
+  }
+
   function setVolume(percent) {
-    volumeProc.command = ["python3", root.scriptPath(), "set-volume", "--percent", String(Math.round(percent))]
+    var rounded = Math.round(percent)
+    updateVolumeOptimistic({percent: rounded})
+    volumeProc.command = ["python3", root.scriptPath(), "set-volume", "--percent", String(rounded)]
     if (!volumeProc.running) volumeProc.running = true
   }
 
   function toggleMute() {
+    updateVolumeOptimistic({muted: !(root.status.volume && root.status.volume.muted)})
     if (!muteProc.running) muteProc.running = true
   }
 
