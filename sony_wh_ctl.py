@@ -21,16 +21,20 @@ import argparse
 import contextlib
 import fcntl
 import json
+import os
 import re
+import secrets
 import socket
+import stat
 import subprocess
 import sys
 import time
 import uuid as uuid_mod
 from pathlib import Path
 
-STATE_PATH = Path.home() / ".local" / "state" / "omarchy-sony-wh-ch720n" / "state.json"
-RFCOMM_LOCK_PATH = STATE_PATH.parent / "rfcomm.lock"
+STATE_DIR = Path.home() / ".local" / "state" / "omarchy-sony-wh-ch720n"
+STATE_FILENAME = "state.json"
+RFCOMM_LOCK_FILENAME = "rfcomm.lock"
 
 SOF = 0x3E
 EOF = 0x3C
@@ -61,6 +65,14 @@ EQ_INQUIRED_TYPE = 0x00
 
 CHANNEL_SCAN_RANGE = range(1, 31)
 DEFAULT_TIMEOUT = 2.0
+
+# Hard cap on a single frame's escaped-inner-stream length, enforced while
+# ingesting (not just checked against afterward). Real MDR replies (NC/EQ
+# state, a handful of bytes) are tiny -- this is generous headroom, not a
+# tuning knob. Without it, a misbehaving or hostile remote device could
+# stream bytes with no EOF for the whole read timeout and grow this
+# process's memory with nothing to stop it.
+MAX_FRAME_BYTES = 4096
 
 # Candidate SPP-family service UUIDs Sony accessories advertise for the MDR
 # protocol (community reverse-engineering; both seen in the wild). BlueZ
@@ -137,13 +149,22 @@ def read_frame(sock, timeout=DEFAULT_TIMEOUT):
                 return None
             data_type, seq = raw[0], raw[1]
             length = int.from_bytes(raw[2:6], "big")
-            if len(raw) < 6 + length + 1:
+            # Bound the trusted length field against the same cap BEFORE
+            # using it to slice payload -- an absurd value here is exactly
+            # as much a sign of a hostile/corrupt frame as an oversized
+            # buffer is.
+            if length > MAX_FRAME_BYTES or len(raw) < 6 + length + 1:
                 return None
             payload = raw[6:6 + length]
             if checksum(raw[:6 + length]) != raw[6 + length]:
                 return None
             return {"data_type": data_type, "seq": seq, "payload": payload}
         buf.append(b)
+        if len(buf) > MAX_FRAME_BYTES:
+            # Stop ingesting immediately rather than continuing to buffer
+            # until the deadline -- a real frame from this protocol never
+            # gets remotely this large.
+            return None
     return None
 
 
@@ -283,11 +304,57 @@ class SonyLink:
 # Bluetooth device discovery (bluetoothctl -- no pybluez dependency)
 # ---------------------------------------------------------------------------
 
+# Generous for the plain-text/JSON output bluetoothctl, pactl, and systemctl
+# normally produce (a handful of KB at most); a hard cap, not a tuning knob.
+# bluetoothctl's output in particular can embed attacker-influenced content
+# (a nearby device's own advertised name), so this isn't purely about a
+# misbehaving *local* tool.
+MAX_SUBPROCESS_BYTES = 65536
+
+
 def run(cmd, timeout=10):
+    """Runs `cmd`, capping stdout and stderr at MAX_SUBPROCESS_BYTES each via
+    a real `head -c` pipeline rather than reading everything into memory and
+    truncating afterward -- so a misbehaving or hostile producer actually
+    stops being read once the cap is hit, instead of merely having its
+    (already fully buffered) output cut down to size after the fact. Reads
+    both streams concurrently (each through its own `head`) to avoid the
+    classic subprocess deadlock a large stderr write could otherwise cause
+    while stdout is being drained.
+    """
     try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
-        return res.returncode, res.stdout, res.stderr
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except Exception as e:
+        return 1, "", str(e)
+
+    out_head = err_head = None
+    try:
+        out_head = subprocess.Popen(["head", "-c", str(MAX_SUBPROCESS_BYTES)],
+                                     stdin=proc.stdout, stdout=subprocess.PIPE)
+        err_head = subprocess.Popen(["head", "-c", str(MAX_SUBPROCESS_BYTES)],
+                                     stdin=proc.stderr, stdout=subprocess.PIPE)
+        # Let each `head` hold the only remaining read end of its pipe --
+        # otherwise this process keeps proc's own pipe ends open too, and
+        # neither `head` ever sees EOF once proc exits.
+        proc.stdout.close()
+        proc.stderr.close()
+
+        deadline = time.monotonic() + timeout
+        out_bytes, _ = out_head.communicate(timeout=max(0.1, deadline - time.monotonic()))
+        err_bytes, _ = err_head.communicate(timeout=max(0.1, deadline - time.monotonic()))
+        proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+        return proc.returncode, out_bytes.decode("utf-8", "replace"), err_bytes.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        for p in (proc, out_head, err_head):
+            if p is not None:
+                with contextlib.suppress(Exception):
+                    p.kill()
+        return 1, "", "timed out"
+    except Exception as e:
+        for p in (proc, out_head, err_head):
+            if p is not None:
+                with contextlib.suppress(Exception):
+                    p.kill()
         return 1, "", str(e)
 
 
@@ -321,12 +388,30 @@ def is_device_connected(mac):
     return re.search(r"^\s*Connected:\s*yes", out, re.MULTILINE) is not None
 
 
+# Bluetooth device names are attacker-influenceable input: any nearby
+# device can advertise (and, once paired, keep) whatever name it wants, and
+# that string flows straight from bluetoothctl's own text output into JSON
+# and then a QML Text item. Cap length and strip anything that isn't a
+# normal printable character before it ever leaves this process -- this is
+# in addition to, not instead of, pinning the QML sink itself to
+# Text.PlainText (see Panel.qml), since PlainText alone doesn't bound
+# length or strip non-printable/control bytes.
+MAX_DISPLAY_STRING_LEN = 128
+
+
+def sanitize_display_string(s, max_len=MAX_DISPLAY_STRING_LEN):
+    if not s:
+        return s
+    cleaned = "".join(ch for ch in s if ch.isprintable() or ch == " ")
+    return cleaned[:max_len]
+
+
 def device_name(mac):
     code, out, _ = run(["bluetoothctl", "info", mac])
     if code != 0:
         return None
     m = re.search(r"^\s*Name:\s*(.+)$", out, re.MULTILINE)
-    return m.group(1).strip() if m else None
+    return sanitize_display_string(m.group(1).strip()) if m else None
 
 
 def battery_percent(mac):
@@ -395,20 +480,144 @@ def set_mute(mac, muted):
 
 # ---------------------------------------------------------------------------
 # State persistence
+#
+# state.json and rfcomm.lock both live at predictable pathnames under
+# STATE_DIR. A planted symlink at either exact path (or a symlink swapped in
+# between two operations on the "same" path) would otherwise let a normal
+# open(path, "w") silently write through it to an arbitrary file this user
+# can write -- or, for reads, load attacker-influenced content. Every access
+# below goes through a held directory file descriptor (opened once,
+# verified to be a real directory we own, O_NOFOLLOW so a symlinked leaf
+# component is refused outright) and openat()-style `dir_fd=` calls, so the
+# directory can't be swapped out from under us between resolving it and
+# acting on a name inside it. Regular-file identity is re-checked on every
+# open. Writes go to a private, exclusively-created temp file in the same
+# directory and are fsync'd, then atomically renamed over the real path --
+# rename(2) replaces whatever is at the destination (symlink or not) as a
+# single unit rather than following it, so a swapped-in symlink there is
+# simply replaced, never dereferenced.
 # ---------------------------------------------------------------------------
 
+class InsecureStatePath(Exception):
+    """A state-directory path isn't safely usable (not ours, not a regular
+    file/directory, or changed identity since it was last checked)."""
+
+
+def _open_private_dir(path: Path) -> int:
+    """Create `path` at mode 0700 if missing, then return an open directory
+    file descriptor for it -- verified to be a real directory, owned by us,
+    and reached via O_NOFOLLOW so a symlink planted at this exact leaf
+    pathname is refused rather than followed. Self-heals loose permissions
+    on a directory we already own (the same mkdir-without-mode gap this
+    exact class of bug has hit before in a sibling plugin); refuses outright
+    if it exists but isn't ours or isn't really a directory, rather than
+    trying to "fix" something we don't trust."""
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise InsecureStatePath(f"{path}: {e}") from e
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        os.close(fd)
+        raise InsecureStatePath(f"{path} is not a directory")
+    if st.st_uid != os.getuid():
+        os.close(fd)
+        raise InsecureStatePath(f"{path} is not owned by the current user")
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        os.fchmod(fd, 0o700)
+    return fd
+
+
+def _open_regular_nofollow(dir_fd: int, name: str, flags: int, mode: int = 0o600) -> int:
+    """openat(dir_fd, name, flags | O_NOFOLLOW), then verify the result is a
+    plain regular file -- refuses a symlink (open itself fails, ELOOP) and
+    also anything else non-regular that might already exist there (a fifo,
+    device, etc., which O_NOFOLLOW alone doesn't catch)."""
+    fd = os.open(name, flags | os.O_NOFOLLOW, mode, dir_fd=dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise InsecureStatePath(f"{name} is not a regular file")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_all_fd(fd) -> str:
+    chunks = []
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def _write_state_dir_file_atomic(dir_fd: int, name: str, text: str) -> None:
+    """Write `text` to `name` under `dir_fd` via a private (0600), exclusively-
+    created temp file in the same directory, fsync'd, then atomically
+    renamed over the real name. rename(2) replaces the destination as a
+    single unit without following it, so this is safe even if `name`
+    currently is (or becomes) a symlink."""
+    tmp_name = f".{name}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+    fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        raise
+
+
 def load_state():
-    if not STATE_PATH.exists():
+    try:
+        dir_fd = _open_private_dir(STATE_DIR)
+    except InsecureStatePath:
         return {}
     try:
-        return json.loads(STATE_PATH.read_text())
-    except Exception:
-        return {}
+        try:
+            fd = _open_regular_nofollow(dir_fd, STATE_FILENAME, os.O_RDONLY)
+        except (OSError, InsecureStatePath):
+            # Covers "doesn't exist yet" (FileNotFoundError) as well as a
+            # symlink or other non-regular node planted at this exact path
+            # (O_NOFOLLOW raises a plain OSError/ELOOP for that case, before
+            # _open_regular_nofollow's own stat check ever runs) -- either
+            # way, there's no state we can safely read, so just report none.
+            return {}
+        try:
+            return json.loads(_read_all_fd(fd))
+        except Exception:
+            return {}
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dir_fd)
 
 
 def save_state(state):
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, indent=2))
+    dir_fd = _open_private_dir(STATE_DIR)
+    try:
+        _write_state_dir_file_atomic(dir_fd, STATE_FILENAME, json.dumps(state, indent=2))
+    finally:
+        os.close(dir_fd)
+
+
+def forget_state():
+    dir_fd = _open_private_dir(STATE_DIR)
+    try:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(STATE_FILENAME, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 # ---------------------------------------------------------------------------
@@ -442,25 +651,37 @@ class RfcommBusy(Exception):
 
 @contextlib.contextmanager
 def rfcomm_lock(timeout=8.0):
-    RFCOMM_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    f = open(RFCOMM_LOCK_PATH, "w")
-    acquired = False
     try:
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise RfcommBusy("Sony headset control channel is busy with another request")
-                time.sleep(0.1)
-        yield
+        dir_fd = _open_private_dir(STATE_DIR)
+    except InsecureStatePath as e:
+        raise RfcommBusy(f"Refusing an unsafe state directory: {e}") from e
+    try:
+        try:
+            lock_fd = _open_regular_nofollow(dir_fd, RFCOMM_LOCK_FILENAME, os.O_RDWR | os.O_CREAT)
+        except (OSError, InsecureStatePath) as e:
+            # A symlink planted at this exact path makes O_NOFOLLOW itself
+            # raise a plain OSError/ELOOP, before _open_regular_nofollow's
+            # own stat-based check would otherwise catch a non-regular node.
+            raise RfcommBusy(f"Refusing an unsafe lock file: {e}") from e
+        acquired = False
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise RfcommBusy("Sony headset control channel is busy with another request")
+                    time.sleep(0.1)
+            yield
+        finally:
+            if acquired:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
     finally:
-        if acquired:
-            fcntl.flock(f, fcntl.LOCK_UN)
-        f.close()
+        os.close(dir_fd)
 
 
 def connect_rfcomm(mac, channel, timeout=3.0):
@@ -667,28 +888,92 @@ AUTOCONNECT_RE = re.compile(r"(bluez5\.auto-connect\s*=\s*\[)([^\]]*)(\])")
 
 
 def find_restrictive_autoconnect_configs():
-    """[(path, current_roles, missing_roles), ...] for user WirePlumber
-    conf.d files that set bluez5.auto-connect without any of the call
-    profile roles."""
+    """[(name, stat_result, current_roles, missing_roles), ...] for user
+    WirePlumber conf.d files that set bluez5.auto-connect without any of the
+    call profile roles. `name` is a plain filename (not a path) and
+    `stat_result` is the identity (dev, ino) it was read at, both meant to be
+    handed to `_reopen_regular_by_identity` later rather than re-resolving
+    the path by string -- see cmd_fix_mic_profile's docblock for why."""
     hits = []
-    if not WIREPLUMBER_CONF_DIR.is_dir():
+    try:
+        dir_fd = _open_dir_nofollow(WIREPLUMBER_CONF_DIR)
+    except OSError:
         return hits
-    for path in sorted(WIREPLUMBER_CONF_DIR.glob("*.conf")):
-        try:
-            text = path.read_text()
-        except OSError:
-            continue
-        m = AUTOCONNECT_RE.search(text)
-        if not m:
-            continue
-        roles = m.group(2).split()
-        missing = [r for r in CALL_PROFILE_ROLES if r not in roles]
-        if missing:
-            hits.append((path, roles, missing))
+    try:
+        for name in sorted(os.listdir(dir_fd)):
+            if not name.endswith(".conf"):
+                continue
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            except OSError:
+                continue
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                text = _read_all_fd(fd)
+            finally:
+                os.close(fd)
+            m = AUTOCONNECT_RE.search(text)
+            if not m:
+                continue
+            roles = m.group(2).split()
+            missing = [r for r in CALL_PROFILE_ROLES if r not in roles]
+            if missing:
+                hits.append((name, st, roles, missing))
+    finally:
+        os.close(dir_fd)
     return hits
 
 
+def _open_dir_nofollow(path: Path) -> int:
+    """openat-style open of an existing directory, O_NOFOLLOW so a symlink
+    at this exact leaf pathname is refused rather than followed. Unlike
+    _open_private_dir, this never creates or chmods anything -- used for
+    directories this plugin doesn't own (the user's own WirePlumber config),
+    where normal, broader-than-0700 permissions are expected and not a bug
+    to "fix"."""
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+
+def _reopen_regular_by_identity(dir_fd: int, name: str, expected_stat):
+    """Re-open `name` under `dir_fd`, refusing a symlink/special file (same
+    as _open_regular_nofollow) AND refusing if it's no longer the SAME file
+    (device+inode) that was scanned earlier. Closes the gap between an
+    earlier scan and later acting on what it found -- an ancestor or leaf
+    replacement in between would otherwise silently redirect the read this
+    performs (and, via cmd_fix_mic_profile, the write that follows it) to
+    whatever's there now instead of what was actually inspected."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise InsecureStatePath(f"{name} is not a regular file")
+        if (st.st_dev, st.st_ino) != (expected_stat.st_dev, expected_stat.st_ino):
+            raise InsecureStatePath(f"{name} changed identity since it was scanned")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def cmd_fix_mic_profile():
+    """Rewrites every conf.d file `find_restrictive_autoconnect_configs`
+    found, as ONE rollback-capable transaction rather than editing files one
+    at a time: every file is re-validated (still the same regular file it
+    was scanned as, not swapped for a symlink or a different file in the
+    meantime), backed up EXCLUSIVELY (refusing rather than following/
+    overwriting anything already at that backup name), and its replacement
+    content staged into its own exclusively-created temp file -- all before
+    any REAL config file is touched. Only once every file in the batch has
+    staged cleanly does it commit each one via an atomic rename; if any
+    single rename in that commit phase fails partway, every already-
+    committed file in this same batch is rolled back to its backup before
+    reporting failure, so a partial failure never leaves some files fixed
+    and others not. The WirePlumber restart is checked, not just requested:
+    overall success requires BOTH the file mutation and the restart to
+    succeed, since a config-only fix with a service that never picked it up
+    isn't actually a fix yet."""
     hits = find_restrictive_autoconnect_configs()
     if not hits:
         print(json.dumps({
@@ -699,22 +984,96 @@ def cmd_fix_mic_profile():
         }))
         return
 
-    fixed_files = []
-    for path, roles, missing in hits:
-        text = path.read_text()
-        backup = path.with_name(path.name + f".bak.{int(time.time())}")
-        backup.write_text(text)
-        new_roles_str = " " + " ".join(roles + missing) + " "
-        new_text = AUTOCONNECT_RE.sub(lambda m: m.group(1) + new_roles_str + m.group(3), text, count=1)
-        path.write_text(new_text)
-        fixed_files.append(str(path))
+    try:
+        dir_fd = _open_dir_nofollow(WIREPLUMBER_CONF_DIR)
+    except OSError as e:
+        print(json.dumps({"success": False, "error": f"Could not reopen the config directory: {e}"}))
+        return
+
+    staged = []  # [(name, tmp_name, backup_name), ...]
+
+    def _cleanup_staged():
+        for _, tmp_name, backup_name in staged:
+            for n in (tmp_name, backup_name):
+                with contextlib.suppress(OSError):
+                    os.unlink(n, dir_fd=dir_fd)
+
+    try:
+        for name, old_stat, roles, missing in hits:
+            fd = _reopen_regular_by_identity(dir_fd, name, old_stat)
+            try:
+                text = _read_all_fd(fd)
+            finally:
+                os.close(fd)
+
+            m = AUTOCONNECT_RE.search(text)
+            if not m:
+                # No longer matches what the scan found -- something
+                # changed the file's actual content since; skip it rather
+                # than act on a stale assumption about what it contains.
+                continue
+            new_roles_str = " " + " ".join(roles + missing) + " "
+            new_text = AUTOCONNECT_RE.sub(lambda mm: mm.group(1) + new_roles_str + mm.group(3), text, count=1)
+
+            backup_name = f"{name}.bak.{int(time.time())}.{secrets.token_hex(3)}"
+            backup_fd = os.open(backup_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+            with os.fdopen(backup_fd, "w") as bf:
+                bf.write(text)
+                bf.flush()
+                os.fsync(bf.fileno())
+
+            tmp_name = f".{name}.tmp.{os.getpid()}.{secrets.token_hex(3)}"
+            tmp_fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+            with os.fdopen(tmp_fd, "w") as tf:
+                tf.write(new_text)
+                tf.flush()
+                os.fsync(tf.fileno())
+
+            staged.append((name, tmp_name, backup_name))
+    except (OSError, InsecureStatePath) as e:
+        _cleanup_staged()
+        os.close(dir_fd)
+        print(json.dumps({"success": False, "error": f"Could not safely stage the fix: {e}"}))
+        return
+
+    committed = []  # [(name, backup_name), ...]
+    commit_error = None
+    for name, tmp_name, backup_name in staged:
+        try:
+            os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            committed.append((name, backup_name))
+        except OSError as e:
+            commit_error = str(e)
+            break
+
+    if commit_error is not None:
+        for name, backup_name in committed:
+            with contextlib.suppress(OSError):
+                os.replace(backup_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        # Anything past the failure point never got renamed into place, so
+        # its own tmp/backup pair is still just staging litter -- clean it
+        # up rather than leaving it behind.
+        committed_names = {name for name, _ in committed}
+        for name, tmp_name, backup_name in staged:
+            if name not in committed_names:
+                for n in (tmp_name, backup_name):
+                    with contextlib.suppress(OSError):
+                        os.unlink(n, dir_fd=dir_fd)
+        os.close(dir_fd)
+        print(json.dumps({
+            "success": False,
+            "error": f"Failed to apply the fix to all files; rolled back what was already changed: {commit_error}",
+        }))
+        return
+
+    os.close(dir_fd)
 
     code, _, err = run(["systemctl", "--user", "restart", "wireplumber"], timeout=15)
     restarted = code == 0
     print(json.dumps({
-        "success": True,
+        "success": restarted,
         "action": "fixed",
-        "files": fixed_files,
+        "files": [name for name, _ in committed],
         "wireplumber_restarted": restarted,
         "restart_error": err.strip() if not restarted else None,
     }))
@@ -785,8 +1144,7 @@ def cmd_detect(args):
 
 
 def cmd_forget():
-    if STATE_PATH.exists():
-        STATE_PATH.unlink()
+    forget_state()
     print(json.dumps({"success": True}))
 
 

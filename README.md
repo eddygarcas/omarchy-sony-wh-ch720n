@@ -145,14 +145,37 @@ rm -rf ~/.local/state/omarchy-sony-wh-ch720n
   and writes only to a file it already found there with a `bluez5.auto-connect`
   override missing the HFP/HSP call-profile roles — never touches a file
   without that exact match, never touches anything under `/etc` or
-  `/usr/share`. Backs the file up (`<name>.bak.<epoch>`) before editing, and
-  runs `systemctl --user restart wireplumber` afterward. Reports "nothing
-  needed fixing" and changes nothing if no such override exists.
-- State lives under `~/.local/state/omarchy-sony-wh-ch720n/`: the detected
-  MAC/RFCOMM channel/protocol dialect (`state.json`), and a lock file
-  (`rfcomm.lock`) used only to serialize concurrent RFCOMM opens against
-  itself — never touched by any other process.
+  `/usr/share`. Every file it touches is re-validated (still the same
+  regular file it was scanned as, not a symlink swapped in since) right
+  before it's used, backed up EXCLUSIVELY (`<name>.bak.<epoch>.<random>`,
+  refusing rather than overwriting if that exact name is somehow already
+  taken) before editing, and the whole batch of files is staged and
+  atomically committed as one operation — if any single file in the batch
+  fails, every file already committed in that same run is rolled back to
+  its own backup, so a partial failure never leaves some files fixed and
+  others not. Runs `systemctl --user restart wireplumber` afterward, and
+  only reports overall success if BOTH the file changes AND that restart
+  succeeded. Reports "nothing needed fixing" and changes nothing if no such
+  override exists.
+- State lives under `~/.local/state/omarchy-sony-wh-ch720n/` (created at
+  mode `0700`, self-healed back to it if looser and still owned by you,
+  refused outright if it's a symlink or owned by someone else): the
+  detected MAC/RFCOMM channel/protocol dialect (`state.json`), written via
+  a private temp file that's atomically renamed into place (never a direct
+  in-place write), and a lock file (`rfcomm.lock`, opened with `O_NOFOLLOW`
+  so a planted symlink at that exact path is refused rather than followed)
+  used only to serialize concurrent RFCOMM opens against itself — never
+  touched by any other process.
 - No network access at all.
+- The Bluetooth frame reader and every subprocess call (`bluetoothctl`,
+  `pactl`, `systemctl`) are byte-capped while ingesting, not just
+  afterward — a misbehaving or hostile producer (including, for
+  `bluetoothctl`, a nearby device's own crafted advertised name) can't grow
+  this process's memory past a small fixed limit. The device name (the one
+  piece of this plugin's data that's genuinely attacker-influenceable) is
+  also length-capped and stripped of control characters before it's ever
+  returned, and every dynamic `Text` item in the panel is pinned to
+  `Text.PlainText` so it can't be misread as rich text either.
 - Like every Quickshell plugin, `Panel.qml` runs unsandboxed inside the
   shared `omarchy-shell` process — review it before installing.
 

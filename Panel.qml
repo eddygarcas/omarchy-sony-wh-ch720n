@@ -36,6 +36,7 @@ Panel {
   property bool isDetecting: false
   property bool isFixingMic: false
   property string lastActionNote: ""
+  property bool lastActionIsError: false
   property string pendingNcMode: ""
 
   onStatusChanged: {
@@ -44,6 +45,25 @@ Panel {
     // trip means "success" and "status reflects it" land at different times.
     if (root.pendingNcMode && root.status.nc && root.status.nc.mode === root.pendingNcMode) {
       root.pendingNcMode = ""
+    }
+
+    // The shared Ui Dropdown's own onClicked handler does `root.value = v`
+    // internally the instant an option is picked -- a plain imperative
+    // assignment, which permanently breaks its `value: root.status.eq...`
+    // binding below (assigning to a property that had a QML binding always
+    // replaces that binding, regardless of which side the assignment comes
+    // from). Without this, the dropdown keeps showing whatever was last
+    // CLICKED forever, even after a status refresh confirms the actual
+    // device preset never changed -- most visible right after clicking an
+    // unsupported named preset (Rock, Jazz, ...), which this headset
+    // reliably refuses: the error note clears after 2s, but the dropdown
+    // would otherwise be stuck showing the failed preset as if it had
+    // applied, with no visual sign it didn't. Re-pushing the real value on
+    // every status update (not just after a failure) re-establishes
+    // "display reflects ground truth" as an invariant that holds
+    // regardless of the severed binding.
+    if (eqPresetDropdown) {
+      eqPresetDropdown.value = root.status.eq ? root.status.eq.preset : "off"
     }
   }
 
@@ -74,50 +94,103 @@ Panel {
     root.status = next
   }
 
+  // --- Action serialization -------------------------------------------
+  //
+  // Every mutating control below (volume, mute, NC mode, voice focus, EQ
+  // preset, EQ bands) follows the same shape: if its Process is already
+  // running a previous request, this one is QUEUED rather than dropped --
+  // only the newest request is kept (an older queued one, if any, is
+  // discarded outright, never run), and it's chained in automatically the
+  // moment the in-flight run's own onStreamFinished fires. That handler
+  // also checks whether a newer request is already queued before treating
+  // its own result as authoritative: if one is, the completion it just saw
+  // belongs to a superseded request, so it must not touch the "pending"
+  // UI state a newer request already set -- only the truly-latest
+  // request's own completion is allowed to do that. This is what actually
+  // prevents "the UI claims a value that was never applied": without it, a
+  // stale completion for request N could clear the pending/spinner state
+  // that request N+1 (already queued) set, making the UI look settled on
+  // N+1's value one full round trip before N+1 has even started running.
+  property var volumePendingRequest: null
+  property var mutePendingRequest: null
+  property var ncPendingRequest: null
+  property var eqPendingRequest: null
+  property bool volumeBusy: false
+  property bool muteBusy: false
+  property bool eqBusy: false
+
   function setVolume(percent) {
     var rounded = Math.round(percent)
     updateVolumeOptimistic({percent: rounded})
-    volumeProc.command = ["python3", root.scriptPath(), "set-volume", "--percent", String(rounded)]
-    if (!volumeProc.running) volumeProc.running = true
+    var args = ["python3", root.scriptPath(), "set-volume", "--percent", String(rounded)]
+    root.volumeBusy = true
+    if (volumeProc.running) {
+      root.volumePendingRequest = args
+      return
+    }
+    root.volumePendingRequest = null
+    volumeProc.command = args
+    volumeProc.running = true
   }
 
   function toggleMute() {
-    updateVolumeOptimistic({muted: !(root.status.volume && root.status.volume.muted)})
-    if (!muteProc.running) muteProc.running = true
+    var nextMuted = !(root.status.volume && root.status.volume.muted)
+    updateVolumeOptimistic({muted: nextMuted})
+    root.muteBusy = true
+    if (muteProc.running) {
+      root.mutePendingRequest = true
+      return
+    }
+    root.mutePendingRequest = null
+    muteProc.running = true
+  }
+
+  function runNc(mode, voiceFocus) {
+    var args = [Quickshell.env("PYTHON") || "python3", root.scriptPath(), "set-nc", "--mode", mode]
+    if (voiceFocus) args.push("--voice-focus")
+    root.pendingNcMode = mode
+    pendingNcTimeoutTimer.restart()
+    if (ncProc.running) {
+      root.ncPendingRequest = {mode: mode, args: args}
+      return
+    }
+    root.ncPendingRequest = null
+    ncProc.command = args
+    ncProc.running = true
   }
 
   function setNcMode(mode) {
-    var voiceFocus = root.status.nc ? root.status.nc.voice_focus : false
-    var args = [Quickshell.env("PYTHON") || "python3", root.scriptPath(), "set-nc", "--mode", mode]
-    if (voiceFocus) args.push("--voice-focus")
-    ncProc.command = args
-    root.pendingNcMode = mode
-    pendingNcTimeoutTimer.restart()
-    if (!ncProc.running) ncProc.running = true
+    root.runNc(mode, root.status.nc ? root.status.nc.voice_focus : false)
   }
 
   function toggleVoiceFocus() {
     var mode = root.status.nc ? root.status.nc.mode : "off"
-    var nextFocus = !(root.status.nc && root.status.nc.voice_focus)
-    var args = ["python3", root.scriptPath(), "set-nc", "--mode", mode]
-    if (nextFocus) args.push("--voice-focus")
-    ncProc.command = args
-    if (!ncProc.running) ncProc.running = true
+    root.runNc(mode, !(root.status.nc && root.status.nc.voice_focus))
+  }
+
+  function runEq(args) {
+    root.eqBusy = true
+    if (eqProc.running) {
+      root.eqPendingRequest = args
+      return
+    }
+    root.eqPendingRequest = null
+    eqProc.command = args
+    eqProc.running = true
   }
 
   function setEqPreset(preset) {
-    eqProc.command = ["python3", root.scriptPath(), "set-eq", "--preset", preset]
-    if (!eqProc.running) eqProc.running = true
+    root.runEq(["python3", root.scriptPath(), "set-eq", "--preset", preset])
   }
 
   function setEqBands(bands) {
-    eqProc.command = ["python3", root.scriptPath(), "set-eq", "--preset", "custom", "--bands", bands.join(",")]
-    if (!eqProc.running) eqProc.running = true
+    root.runEq(["python3", root.scriptPath(), "set-eq", "--preset", "custom", "--bands", bands.join(",")])
   }
 
   function detectDevice() {
+    if (root.isDetecting) return
     root.isDetecting = true
-    if (!detectProc.running) detectProc.running = true
+    detectProc.running = true
   }
 
   function forgetDevice() {
@@ -125,8 +198,9 @@ Panel {
   }
 
   function fixMicProfile() {
+    if (root.isFixingMic) return
     root.isFixingMic = true
-    if (!fixMicProc.running) fixMicProc.running = true
+    fixMicProc.running = true
   }
 
   Timer {
@@ -157,7 +231,17 @@ Panel {
     id: volumeProc
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.fetchStatus()
+      onStreamFinished: {
+        var next = root.volumePendingRequest
+        if (next) {
+          root.volumePendingRequest = null
+          volumeProc.command = next
+          volumeProc.running = true
+          return
+        }
+        root.volumeBusy = false
+        root.fetchStatus()
+      }
     }
   }
 
@@ -166,7 +250,15 @@ Panel {
     command: ["python3", root.scriptPath(), "toggle-mute"]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.fetchStatus()
+      onStreamFinished: {
+        if (root.mutePendingRequest) {
+          root.mutePendingRequest = null
+          muteProc.running = true
+          return
+        }
+        root.muteBusy = false
+        root.fetchStatus()
+      }
     }
   }
 
@@ -175,11 +267,22 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var ok = false
-        try { ok = JSON.parse(text || "{}").success } catch (e) {}
-        root.lastActionNote = ok ? "Saved" : "Error"
-        clearNoteTimer.restart()
-        if (!ok) { root.pendingNcMode = ""; pendingNcTimeoutTimer.stop() }
+        var result = {}
+        try { result = JSON.parse(text || "{}") } catch (e) {}
+
+        var next = root.ncPendingRequest
+        if (next) {
+          // A newer request already superseded this one -- root.pendingNcMode
+          // already reflects `next.mode`, not this run's, so leave it alone
+          // and chain straight into the queued request instead.
+          root.ncPendingRequest = null
+          ncProc.command = next.args
+          ncProc.running = true
+          return
+        }
+
+        root.showActionNote(result.success ? "Saved" : (result.error || "Error"), !result.success)
+        if (!result.success) { root.pendingNcMode = ""; pendingNcTimeoutTimer.stop() }
         root.fetchStatus()
       }
     }
@@ -190,10 +293,19 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var ok = false
-        try { ok = JSON.parse(text || "{}").success } catch (e) {}
-        root.lastActionNote = ok ? "Saved" : "Error"
-        clearNoteTimer.restart()
+        var result = {}
+        try { result = JSON.parse(text || "{}") } catch (e) {}
+
+        var next = root.eqPendingRequest
+        if (next) {
+          root.eqPendingRequest = null
+          eqProc.command = next
+          eqProc.running = true
+          return
+        }
+
+        root.eqBusy = false
+        root.showActionNote(result.success ? "Saved" : (result.error || "Error"), !result.success)
         root.fetchStatus()
       }
     }
@@ -206,10 +318,14 @@ Panel {
       waitForEnd: true
       onStreamFinished: {
         root.isDetecting = false
-        var ok = false
-        try { ok = JSON.parse(text || "{}").success } catch (e) {}
-        root.lastActionNote = ok ? "Detected" : "Not found"
-        clearNoteTimer.restart()
+        var result = {}
+        try { result = JSON.parse(text || "{}") } catch (e) {}
+        // Keep this note short even on failure -- a detect failure's real
+        // reason is often a long paragraph (see detect()'s docstring in
+        // sony_wh_ctl.py) that's better suited to the wrapping error banner
+        // at the top of the panel, which the fetchStatus() call below
+        // populates from the same persisted last_detect_error.
+        root.showActionNote(result.success ? "Detected" : "Not found", !result.success)
         root.fetchStatus()
       }
     }
@@ -233,10 +349,9 @@ Panel {
         root.isFixingMic = false
         var result = {}
         try { result = JSON.parse(text || "{}") } catch (e) {}
-        if (!result.success) root.lastActionNote = "Error"
-        else if (result.action === "fixed") root.lastActionNote = "Mic profile fixed"
-        else root.lastActionNote = "No fix needed"
-        clearNoteTimer.restart()
+        if (!result.success) root.showActionNote(result.error || "Error", true)
+        else if (result.action === "fixed") root.showActionNote("Mic profile fixed", false)
+        else root.showActionNote("No fix needed", false)
       }
     }
   }
@@ -244,7 +359,17 @@ Panel {
   Timer {
     id: clearNoteTimer
     interval: 2000
-    onTriggered: root.lastActionNote = ""
+    onTriggered: { root.lastActionNote = ""; root.lastActionIsError = false }
+  }
+
+  // Errors carry an actual reason (e.g. "This headset did not accept the
+  // 'rock' preset...") that's worth reading, not just a generic "Error" --
+  // shown for longer than a plain "Saved" confirmation.
+  function showActionNote(text, isError) {
+    root.lastActionNote = text
+    root.lastActionIsError = isError
+    clearNoteTimer.interval = isError ? 6000 : 2000
+    clearNoteTimer.restart()
   }
 
   BarIconButton {
@@ -290,6 +415,7 @@ Panel {
 
           Text {
             text: root.status.name || "Sony WH-CH720N"
+            textFormat: Text.PlainText
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.title
@@ -317,6 +443,7 @@ Panel {
         visible: !!root.status.error
         Layout.fillWidth: true
         text: root.status.error || ""
+        textFormat: Text.PlainText
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -418,6 +545,8 @@ Panel {
                 maximum: 100
                 step: 1
                 integer: true
+                enabled: !root.volumeBusy
+                opacity: enabled ? 1.0 : 0.6
                 value: root.status.volume ? root.status.volume.percent : 0
                 onReleased: function(v) { root.setVolume(v) }
               }
@@ -430,6 +559,8 @@ Panel {
             Layout.fillWidth: true
             label: "Mute"
             description: "Silence the headphones without changing volume level"
+            enabled: !root.muteBusy
+            opacity: enabled ? 1.0 : 0.6
             checked: !!(root.status.volume && root.status.volume.muted)
             onClicked: root.toggleMute()
           }
@@ -537,8 +668,11 @@ Panel {
           spacing: Style.space(10)
 
           Dropdown {
+            id: eqPresetDropdown
             Layout.fillWidth: true
             label: "Preset"
+            enabled: !root.eqBusy
+            opacity: enabled ? 1.0 : 0.6
             value: root.status.eq ? root.status.eq.preset : "off"
             options: Model.eqPresetOptions()
             onChanged: function(val) { root.setEqPreset(val) }
@@ -581,6 +715,8 @@ Panel {
                   maximum: 10
                   step: 1
                   integer: true
+                  enabled: !root.eqBusy
+                  opacity: enabled ? 1.0 : 0.6
                   value: (root.status.eq && root.status.eq.bands && root.status.eq.bands[index] !== undefined) ? root.status.eq.bands[index] : 0
                   onReleased: function(v) {
                     var bands = (root.status.eq && root.status.eq.bands) ? root.status.eq.bands.slice() : [0, 0, 0, 0, 0, 0]
@@ -653,6 +789,7 @@ Panel {
           MouseArea {
             id: detectHover
             anchors.fill: parent
+            enabled: !root.isDetecting
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
             onClicked: root.detectDevice()
@@ -700,6 +837,7 @@ Panel {
           MouseArea {
             id: fixMicHover
             anchors.fill: parent
+            enabled: !root.isFixingMic
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
             onClicked: root.fixMicProfile()
@@ -715,8 +853,9 @@ Panel {
       // height even when empty, so this row's height is stable too.
       Text {
         Layout.fillWidth: true
-        text: root.lastActionNote ? "✓ " + root.lastActionNote : ""
-        color: root.dim
+        text: root.lastActionNote ? (root.lastActionIsError ? "✗ " : "✓ ") + root.lastActionNote : ""
+        textFormat: Text.PlainText
+        color: root.lastActionIsError ? "#e6392b" : root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         horizontalAlignment: Text.AlignRight
