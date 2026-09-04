@@ -503,23 +503,83 @@ class InsecureStatePath(Exception):
     file/directory, or changed identity since it was last checked)."""
 
 
+class ReadTooLarge(Exception):
+    """A file exceeded its configured read cap while being loaded."""
+
+
+# Caps for every file this plugin reads off disk under a dir_fd (state.json
+# and WirePlumber conf.d overrides). All of these are small, hand-edited or
+# self-generated files -- a handful of KB at most -- so these caps are
+# generous headroom, not a tuning knob. Without them, a swapped-in
+# replacement regular file (same path, attacker-controlled content) could
+# still make _read_all_fd() buffer arbitrary amounts of memory before the
+# JSON/regex handling downstream ever gets a chance to reject it.
+MAX_STATE_FILE_BYTES = 64 * 1024
+MAX_CONF_FILE_BYTES = 256 * 1024
+MAX_CONF_FILES = 64
+MAX_CONF_DIR_ENTRIES = 4096
+MAX_CONF_TOTAL_BYTES = 2 * 1024 * 1024
+
+
+def _open_dir_chain_nofollow(anchor_fd: int, components) -> int:
+    """Descend from an already-open, trusted directory fd through each path
+    component via openat(..., O_DIRECTORY | O_NOFOLLOW), so no ancestor in
+    the chain -- not just the final leaf -- can be a symlink that redirects
+    us somewhere else. Each intermediate fd is closed as soon as the next
+    one is opened; the caller owns the returned final fd. Raises OSError if
+    any component is missing, isn't a directory, or is a symlink."""
+    fd = anchor_fd
+    owns_fd = False
+    try:
+        for name in components:
+            next_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            if owns_fd:
+                os.close(fd)
+            fd = next_fd
+            owns_fd = True
+        return fd
+    except BaseException:
+        if owns_fd:
+            os.close(fd)
+        raise
+
+
 def _open_private_dir(path: Path) -> int:
     """Create `path` at mode 0700 if missing, then return an open directory
-    file descriptor for it -- verified to be a real directory, owned by us,
-    and reached via O_NOFOLLOW so a symlink planted at this exact leaf
-    pathname is refused rather than followed. Self-heals loose permissions
-    on a directory we already own (the same mkdir-without-mode gap this
-    exact class of bug has hit before in a sibling plugin); refuses outright
-    if it exists but isn't ours or isn't really a directory, rather than
-    trying to "fix" something we don't trust."""
+    file descriptor for it -- verified to be a real directory, owned by us.
+    Every component from $HOME down (not just the final leaf) is opened
+    directory-relative with O_NOFOLLOW via `_open_dir_chain_nofollow`, so a
+    mutable ancestor (e.g. `.local` or `.local/state`) swapped for a symlink
+    can't silently redirect the state/lock operations that follow into a
+    different, merely same-owner directory. Self-heals loose permissions on
+    a directory we already own (the same mkdir-without-mode gap this exact
+    class of bug has hit before in a sibling plugin); refuses outright if it
+    exists but isn't ours or isn't really a directory, rather than trying to
+    "fix" something we don't trust."""
+    home = Path.home()
+    *parents, leaf = path.relative_to(home).parts
     try:
-        os.mkdir(path, 0o700)
-    except FileExistsError:
-        pass
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
     except OSError as e:
-        raise InsecureStatePath(f"{path}: {e}") from e
+        raise InsecureStatePath(f"{home}: {e}") from e
+    try:
+        try:
+            parent_fd = _open_dir_chain_nofollow(home_fd, parents) if parents else os.dup(home_fd)
+        except OSError as e:
+            raise InsecureStatePath(f"{path}: {e}") from e
+    finally:
+        os.close(home_fd)
+    try:
+        try:
+            os.mkdir(leaf, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        try:
+            fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        except OSError as e:
+            raise InsecureStatePath(f"{path}: {e}") from e
+    finally:
+        os.close(parent_fd)
     st = os.fstat(fd)
     if not stat.S_ISDIR(st.st_mode):
         os.close(fd)
@@ -548,13 +608,22 @@ def _open_regular_nofollow(dir_fd: int, name: str, flags: int, mode: int = 0o600
         raise
 
 
-def _read_all_fd(fd) -> str:
+def _read_all_fd(fd, max_bytes: int) -> str:
+    """Read at most `max_bytes` from fd, raising ReadTooLarge the moment the
+    file turns out to hold more than that -- reads up to max_bytes + 1 so an
+    exact-cap-sized file doesn't false-positive, while never buffering more
+    than that regardless of how large the underlying file actually is."""
     chunks = []
-    while True:
-        chunk = os.read(fd, 65536)
+    total = 0
+    limit = max_bytes + 1
+    while total < limit:
+        chunk = os.read(fd, min(65536, limit - total))
         if not chunk:
             break
         chunks.append(chunk)
+        total += len(chunk)
+    if total > max_bytes:
+        raise ReadTooLarge(f"exceeds {max_bytes}-byte cap")
     return b"".join(chunks).decode("utf-8", errors="replace")
 
 
@@ -563,7 +632,10 @@ def _write_state_dir_file_atomic(dir_fd: int, name: str, text: str) -> None:
     created temp file in the same directory, fsync'd, then atomically
     renamed over the real name. rename(2) replaces the destination as a
     single unit without following it, so this is safe even if `name`
-    currently is (or becomes) a symlink."""
+    currently is (or becomes) a symlink. The containing directory is fsync'd
+    afterward too -- without that, the rename itself (a directory-entry
+    change, distinct from the file-content fsync above) can still be lost on
+    a crash even though the write it reported success for looked durable."""
     tmp_name = f".{name}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
     fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
     try:
@@ -572,6 +644,7 @@ def _write_state_dir_file_atomic(dir_fd: int, name: str, text: str) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.fsync(dir_fd)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp_name, dir_fd=dir_fd)
@@ -594,7 +667,7 @@ def load_state():
             # way, there's no state we can safely read, so just report none.
             return {}
         try:
-            return json.loads(_read_all_fd(fd))
+            return json.loads(_read_all_fd(fd, MAX_STATE_FILE_BYTES))
         except Exception:
             return {}
         finally:
@@ -616,6 +689,7 @@ def forget_state():
     try:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(STATE_FILENAME, dir_fd=dir_fd)
+            os.fsync(dir_fd)
     finally:
         os.close(dir_fd)
 
@@ -893,16 +967,34 @@ def find_restrictive_autoconnect_configs():
     call profile roles. `name` is a plain filename (not a path) and
     `stat_result` is the identity (dev, ino) it was read at, both meant to be
     handed to `_reopen_regular_by_identity` later rather than re-resolving
-    the path by string -- see cmd_fix_mic_profile's docblock for why."""
+    the path by string -- see cmd_fix_mic_profile's docblock for why.
+
+    The directory walk itself is bounded (MAX_CONF_DIR_ENTRIES) before
+    anything is sorted or opened, since a directory listing this plugin
+    doesn't control could otherwise hold an unbounded number of entries; the
+    number of files actually opened and read is separately capped
+    (MAX_CONF_FILES), as is the running total of bytes read across all of
+    them (MAX_CONF_TOTAL_BYTES), on top of the per-file cap each individual
+    read already enforces."""
     hits = []
     try:
         dir_fd = _open_dir_nofollow(WIREPLUMBER_CONF_DIR)
     except OSError:
         return hits
     try:
-        for name in sorted(os.listdir(dir_fd)):
-            if not name.endswith(".conf"):
-                continue
+        names = []
+        with os.scandir(dir_fd) as it:
+            for i, entry in enumerate(it):
+                if i >= MAX_CONF_DIR_ENTRIES:
+                    break
+                if entry.name.endswith(".conf"):
+                    names.append(entry.name)
+        names.sort()
+
+        total_bytes = 0
+        for name in names[:MAX_CONF_FILES]:
+            if total_bytes >= MAX_CONF_TOTAL_BYTES:
+                break
             try:
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
             except OSError:
@@ -911,9 +1003,14 @@ def find_restrictive_autoconnect_configs():
                 st = os.fstat(fd)
                 if not stat.S_ISREG(st.st_mode):
                     continue
-                text = _read_all_fd(fd)
+                per_file_cap = min(MAX_CONF_FILE_BYTES, MAX_CONF_TOTAL_BYTES - total_bytes)
+                try:
+                    text = _read_all_fd(fd, per_file_cap)
+                except ReadTooLarge:
+                    continue
             finally:
                 os.close(fd)
+            total_bytes += len(text)
             m = AUTOCONNECT_RE.search(text)
             if not m:
                 continue
@@ -927,13 +1024,22 @@ def find_restrictive_autoconnect_configs():
 
 
 def _open_dir_nofollow(path: Path) -> int:
-    """openat-style open of an existing directory, O_NOFOLLOW so a symlink
-    at this exact leaf pathname is refused rather than followed. Unlike
-    _open_private_dir, this never creates or chmods anything -- used for
-    directories this plugin doesn't own (the user's own WirePlumber config),
-    where normal, broader-than-0700 permissions are expected and not a bug
-    to "fix"."""
-    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    """openat-style open of an existing directory. Every component from
+    $HOME down (not just the final leaf) is opened directory-relative with
+    O_NOFOLLOW via `_open_dir_chain_nofollow`, so a mutable ancestor (e.g.
+    `.config` or `.config/wireplumber`) swapped for a symlink can't
+    redirect the scan/rewrite that follows into a different directory.
+    Unlike _open_private_dir, this never creates or chmods anything and
+    performs no ownership check -- used for directories this plugin doesn't
+    own (the user's own WirePlumber config), where normal, broader-than-0700
+    permissions are expected and not a bug to "fix"."""
+    home = Path.home()
+    components = path.relative_to(home).parts
+    home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        return _open_dir_chain_nofollow(home_fd, components)
+    finally:
+        os.close(home_fd)
 
 
 def _reopen_regular_by_identity(dir_fd: int, name: str, expected_stat):
@@ -965,15 +1071,24 @@ def cmd_fix_mic_profile():
     meantime), backed up EXCLUSIVELY (refusing rather than following/
     overwriting anything already at that backup name), and its replacement
     content staged into its own exclusively-created temp file -- all before
-    any REAL config file is touched. Only once every file in the batch has
-    staged cleanly does it commit each one via an atomic rename; if any
-    single rename in that commit phase fails partway, every already-
-    committed file in this same batch is rolled back to its backup before
-    reporting failure, so a partial failure never leaves some files fixed
-    and others not. The WirePlumber restart is checked, not just requested:
-    overall success requires BOTH the file mutation and the restart to
-    succeed, since a config-only fix with a service that never picked it up
-    isn't actually a fix yet."""
+    any REAL config file is touched. Immediately before each commit-phase
+    rename, the original is re-opened by identity AND its content re-read
+    and compared byte-for-byte against what was staged from; either a
+    reopen failure or ANY content drift aborts the WHOLE transaction (not
+    just that one file) rather than silently overwriting a concurrent
+    legitimate writer. If any commit fails partway, every already-committed
+    file in this same batch is rolled back to its backup -- but only after
+    confirming its current content still matches what THIS run wrote there;
+    a file that has since changed again is left alone rather than clobbered
+    with stale bytes, and reported separately. The directory is fsync'd
+    after both a full commit and a rollback, since the renames are
+    directory-entry changes distinct from the per-file content fsyncs
+    already done. The WirePlumber restart is checked, not just requested:
+    overall "success" requires BOTH the file mutation and the restart to
+    succeed, but the JSON response says explicitly when the config was
+    committed despite `success: false`, since a config-only fix with a
+    service that never picked it up isn't a total failure either -- the
+    caller needs to know the file state is not "nothing happened"."""
     hits = find_restrictive_autoconnect_configs()
     if not hits:
         print(json.dumps({
@@ -990,11 +1105,11 @@ def cmd_fix_mic_profile():
         print(json.dumps({"success": False, "error": f"Could not reopen the config directory: {e}"}))
         return
 
-    staged = []  # [(name, tmp_name, backup_name), ...]
+    staged = []  # [(name, tmp_name, backup_name, old_stat, orig_text, new_text), ...]
 
-    def _cleanup_staged():
-        for _, tmp_name, backup_name in staged:
-            for n in (tmp_name, backup_name):
+    def _cleanup_staged(entries):
+        for entry in entries:
+            for n in (entry[1], entry[2]):
                 with contextlib.suppress(OSError):
                     os.unlink(n, dir_fd=dir_fd)
 
@@ -1002,7 +1117,7 @@ def cmd_fix_mic_profile():
         for name, old_stat, roles, missing in hits:
             fd = _reopen_regular_by_identity(dir_fd, name, old_stat)
             try:
-                text = _read_all_fd(fd)
+                text = _read_all_fd(fd, MAX_CONF_FILE_BYTES)
             finally:
                 os.close(fd)
 
@@ -1029,53 +1144,91 @@ def cmd_fix_mic_profile():
                 tf.flush()
                 os.fsync(tf.fileno())
 
-            staged.append((name, tmp_name, backup_name))
-    except (OSError, InsecureStatePath) as e:
-        _cleanup_staged()
+            staged.append((name, tmp_name, backup_name, old_stat, text, new_text))
+    except (OSError, InsecureStatePath, ReadTooLarge) as e:
+        _cleanup_staged(staged)
         os.close(dir_fd)
         print(json.dumps({"success": False, "error": f"Could not safely stage the fix: {e}"}))
         return
 
-    committed = []  # [(name, backup_name), ...]
+    committed = []  # [(name, backup_name, new_text), ...]
     commit_error = None
-    for name, tmp_name, backup_name in staged:
+    for name, tmp_name, backup_name, old_stat, orig_text, new_text in staged:
+        try:
+            check_fd = _reopen_regular_by_identity(dir_fd, name, old_stat)
+            try:
+                current_text = _read_all_fd(check_fd, MAX_CONF_FILE_BYTES)
+            finally:
+                os.close(check_fd)
+            if current_text != orig_text:
+                raise InsecureStatePath(f"{name} content changed since it was staged")
+        except (OSError, InsecureStatePath, ReadTooLarge) as e:
+            commit_error = f"{name} changed after staging, aborting before any further commits: {e}"
+            break
         try:
             os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-            committed.append((name, backup_name))
+            committed.append((name, backup_name, new_text))
         except OSError as e:
             commit_error = str(e)
             break
 
     if commit_error is not None:
-        for name, backup_name in committed:
+        drifted = []
+        for name, backup_name, expected_text in committed:
+            try:
+                cur_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+                try:
+                    current_text = _read_all_fd(cur_fd, MAX_CONF_FILE_BYTES)
+                finally:
+                    os.close(cur_fd)
+            except (OSError, ReadTooLarge):
+                current_text = None
+            if current_text != expected_text:
+                # Something touched this file again after we committed our
+                # fix to it -- restoring the backup now would silently
+                # overwrite that newer write, so leave it as-is and surface
+                # the drift instead of "fixing" it further.
+                drifted.append(name)
+                with contextlib.suppress(OSError):
+                    os.unlink(backup_name, dir_fd=dir_fd)
+                continue
             with contextlib.suppress(OSError):
                 os.replace(backup_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         # Anything past the failure point never got renamed into place, so
         # its own tmp/backup pair is still just staging litter -- clean it
         # up rather than leaving it behind.
-        committed_names = {name for name, _ in committed}
-        for name, tmp_name, backup_name in staged:
-            if name not in committed_names:
-                for n in (tmp_name, backup_name):
-                    with contextlib.suppress(OSError):
-                        os.unlink(n, dir_fd=dir_fd)
+        committed_names = {name for name, _, _ in committed}
+        _cleanup_staged(e for e in staged if e[0] not in committed_names)
+        os.fsync(dir_fd)
         os.close(dir_fd)
         print(json.dumps({
             "success": False,
             "error": f"Failed to apply the fix to all files; rolled back what was already changed: {commit_error}",
+            "drifted_not_rolled_back": drifted or None,
         }))
         return
 
+    os.fsync(dir_fd)
     os.close(dir_fd)
 
     code, _, err = run(["systemctl", "--user", "restart", "wireplumber"], timeout=15)
     restarted = code == 0
+    # The config files are already committed at this point regardless of
+    # whether the restart below succeeds -- `error` is set on restart
+    # failure specifically so the panel doesn't fall back to a bare "Error"
+    # that erases the fact that the fix DID get written to disk.
     print(json.dumps({
         "success": restarted,
         "action": "fixed",
-        "files": [name for name, _ in committed],
+        "files": [name for name, _, _ in committed],
+        "config_committed": True,
         "wireplumber_restarted": restarted,
+        "partial": not restarted,
         "restart_error": err.strip() if not restarted else None,
+        "error": (
+            f"Config fixed, but restarting WirePlumber failed (the fix will "
+            f"take effect next time it restarts): {err.strip()}"
+        ) if not restarted else None,
     }))
 
 
